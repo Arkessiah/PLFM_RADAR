@@ -62,6 +62,20 @@ module radar_system_top_50t (
     input wire adc_dco_n,
     output wire adc_pwdn,
 
+    // ----- AD9484 overflow flag (differential) -----
+    // Schematic pads M6 (OR_P) / N6 (OR_N). Anchored-only for now; a future
+    // PR will wire this into the receive-path status flags for AGC feedback.
+    input wire adc_or_p,
+    input wire adc_or_n,
+
+    // ----- Tap of AD9523 -> AD9484 sample clock (differential) -----
+    // Schematic pads N11 (P) / N12 (N). Must remain input-only — driving
+    // these pads as outputs would contend with the AD9523 driver feeding
+    // the ADC. Anchored with an IBUFDS (DONT_TOUCH) below; buffered net is
+    // unconsumed pending a follow-up PR.
+    input wire fpga_adc_clock_p,
+    input wire fpga_adc_clock_n,
+
     // ===== STM32 Control (Bank 15: 3.3V) =====
     input wire stm32_new_chirp,
     input wire stm32_new_elevation,
@@ -83,6 +97,38 @@ module radar_system_top_50t (
     output wire gpio_dig6,            // DIG_6 (G12→PD14): reserved
     output wire gpio_dig7             // DIG_7 (H12→PD15): reserved
 );
+
+    // =====================================================================
+    // Anchored-but-unused schematic inputs (secured via IBUFDS + DONT_TOUCH)
+    // =====================================================================
+    // Without these buffer instantiations, synthesis would remove the
+    // orphan input ports (UCIO / NSTD warnings) and the XDC pin constraints
+    // would fail to bind. DONT_TOUCH forces Vivado to retain the buffer
+    // primitives and their package-pin connections across all optimization
+    // stages. The buffered nets are intentionally left unconsumed here;
+    // they will be wired into the RTL in a follow-up PR once the ADC
+    // status-flag and sample-clock-tap features are implemented.
+    (* DONT_TOUCH = "TRUE" *) wire adc_or_buf;
+    (* DONT_TOUCH = "TRUE" *) IBUFDS #(
+        .DIFF_TERM   ("TRUE"),
+        .IBUF_LOW_PWR("FALSE"),
+        .IOSTANDARD  ("LVDS_25")
+    ) u_ibufds_adc_or (
+        .O  (adc_or_buf),
+        .I  (adc_or_p),
+        .IB (adc_or_n)
+    );
+
+    (* DONT_TOUCH = "TRUE" *) wire fpga_adc_clock_buf;
+    (* DONT_TOUCH = "TRUE" *) IBUFDS #(
+        .DIFF_TERM   ("TRUE"),
+        .IBUF_LOW_PWR("FALSE"),
+        .IOSTANDARD  ("LVDS_25")
+    ) u_ibufds_fpga_adc_clk (
+        .O  (fpga_adc_clock_buf),
+        .I  (fpga_adc_clock_p),
+        .IB (fpga_adc_clock_n)
+    );
 
     // ===== Tie-off wires for unconstrained FT601 inputs (inactive with USB_MODE=1) =====
     wire        ft601_txe_tied    = 1'b0;

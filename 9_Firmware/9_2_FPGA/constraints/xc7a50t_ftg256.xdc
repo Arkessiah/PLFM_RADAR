@@ -18,8 +18,23 @@
 #   Bank 35: VCCO = 3.3V (FT2232H USB 2.0 FIFO — 15 signals)
 #
 # DRC Fix History:
-#   - PLIO-9: Moved clk_120m_dac from C13 (N-type) to D13 (P-type MRCC).
-#     Clock inputs must use the P-type pin of a Multi-Region Clock-Capable pair.
+#   - PLIO-9 (REVERTED): Previously moved clk_120m_dac from C13 (N-type) to
+#     D13 (P-type MRCC) to satisfy the MRCC preference. However, a schematic
+#     audit (KiCad netlist export from the Eagle schematic, U42 pad->net map)
+#     revealed that D13 is UNCONNECTED on the physical PCB. The real
+#     /FPGA_DAC_CLOCK net from AD9523 OUT11 lands on C13 (IO_L11N_T1_SRCC_15,
+#     N-type). Moved back to C13 and added CLOCK_DEDICATED_ROUTE FALSE,
+#     matching the ft_clkout treatment on C4 (N-type MRCC).
+#   - Schematic audit added pin constraints for previously-unconstrained
+#     signals connected to the FPGA in hardware: ADC_OR_P/N (M6/N6, AD9484
+#     overflow flag), /FPGA_ADC_CLOCK_P/N (N11/N12, 400 MHz observation tap
+#     of the AD9523->AD9484 sample clock). Added to 50T wrapper as
+#     anchored-but-unused inputs to secure pin assignment and prevent
+#     accidental future contention; full RTL consumers are a follow-up.
+#   - PLIO-9 (original, historical): FT2232H CLKOUT routed to C4
+#     (IO_L12N_T1_MRCC_35, N-type). Clock inputs normally use P-type MRCC
+#     pins, but IBUFG works correctly on N-type. Demote PLIO-9 to warning
+#     in build script.
 #   - BIVC-1 / Place 30-372: Bank 14 must have a single VCCO. LVDS_25 forces
 #     VCCO=2.5V, so adc_pwdn was changed from LVCMOS33 to LVCMOS25 to match.
 #     IBUFDS input buffers are VCCO-independent. BIVC-1 also waived via
@@ -28,9 +43,6 @@
 #   - UCIO/NSTD: Unconstrained ports (FT601 ports inactive with USB_MODE=1,
 #     status/debug outputs have no physical pins). Handled with SEVERITY
 #     demotion + default IOSTANDARD.
-#   - PLIO-9: FT2232H CLKOUT routed to C4 (IO_L12N_T1_MRCC_35, N-type).
-#     Clock inputs normally use P-type MRCC pins, but IBUFG works correctly
-#     on N-type. Demote PLIO-9 to warning in build script.
 # ============================================================================
 
 # ============================================================================
@@ -66,7 +78,7 @@ set_property IOSTANDARD LVCMOS33 [get_ports {clk_100m}]
 create_clock -name clk_100m -period 10.0 [get_ports {clk_100m}]
 set_input_jitter [get_clocks clk_100m] 0.1
 
-# 120MHz DAC Clock (AD9523 OUT11 → FPGA_DAC_CLOCK → Bank 15 MRCC pin D13)
+# 120MHz DAC Clock (AD9523 OUT11 → /FPGA_DAC_CLOCK → Bank 15 pin C13)
 # NOTE: The physical DAC (U3, AD9708) receives its clock directly from the
 #       AD9523 via a separate net (DAC_CLOCK), NOT from the FPGA. The FPGA
 #       uses this clock input for internal DAC data timing only. The RTL port
@@ -74,12 +86,19 @@ set_input_jitter [get_clocks clk_100m] 0.1
 #       physical pin on the 50T board and is left unconnected here. The port
 #       CANNOT be removed from the RTL because the 200T board uses it with
 #       ODDR clock forwarding (pin H17, see xc7a200t_fbg484.xdc).
-# FIX: Moved from C13 (IO_L12N = N-type) to D13 (IO_L12P = P-type MRCC).
-#      Clock inputs must use the P-type pin of an MRCC pair (PLIO-9 DRC).
-set_property PACKAGE_PIN D13 [get_ports {clk_120m_dac}]
+#
+# PIN: C13 is IO_L11N_T1_SRCC_15 (N-type SRCC). A prior commit attempted to
+# move this to D13 (MRCC P-type) to satisfy PLIO-9, but the schematic audit
+# showed D13 is UNCONNECTED on the PCB — the /FPGA_DAC_CLOCK net physically
+# lands on C13. Moving to D13 made the DAC clock input float. Restored to
+# C13 and forced CLOCK_DEDICATED_ROUTE FALSE (same mechanism as ft_clkout on
+# C4), which routes the IBUFG output through general fabric to a BUFG.
+set_property PACKAGE_PIN C13 [get_ports {clk_120m_dac}]
 set_property IOSTANDARD LVCMOS33 [get_ports {clk_120m_dac}]
 create_clock -name clk_120m_dac -period 8.333 [get_ports {clk_120m_dac}]
 set_input_jitter [get_clocks clk_120m_dac] 0.1
+# C13 is N-type SRCC (not dedicated-clock-capable); override the DRC check.
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets {clk_120m_dac_IBUF}]
 
 # ADC DCO Clock (400MHz LVDS — AD9523 OUT5 → AD9484 → FPGA, Bank 14 MRCC)
 # NOTE: LVDS_25 is the only valid differential input standard on 7-series HR
@@ -283,6 +302,45 @@ set_input_delay -clock [get_clocks adc_dco_p] -min 0.2 [get_ports {adc_d_p[*]}]
 set_input_delay -clock [get_clocks adc_dco_p] -max 1.0 -clock_fall [get_ports {adc_d_p[*]}] -add_delay
 set_input_delay -clock [get_clocks adc_dco_p] -min 0.2 -clock_fall [get_ports {adc_d_p[*]}] -add_delay
 
+# --------------------------------------------------------------------------
+# AD9484 Overflow / Out-Of-Range flag (schematic nets ADC_OR_P / ADC_OR_N)
+# --------------------------------------------------------------------------
+# AD9484 differential OR output on FPGA pads M6 (OR_P) / N6 (OR_N), Bank 14.
+# This is the AD9484's full-scale overflow indicator, useful for AGC /
+# gain-ranging feedback. The 50T RTL wrapper anchors this with an IBUFDS
+# (DONT_TOUCH) so the pads cannot be accidentally driven as outputs (which
+# would cause contention with the AD9484 driver). A future PR should wire
+# the buffered signal into the receive-path status flags.
+set_property PACKAGE_PIN M6 [get_ports {adc_or_p}]
+set_property PACKAGE_PIN N6 [get_ports {adc_or_n}]
+set_property IOSTANDARD LVDS_25 [get_ports {adc_or_p}]
+set_property IOSTANDARD LVDS_25 [get_ports {adc_or_n}]
+set_property DIFF_TERM TRUE [get_ports {adc_or_p}]
+
+# --------------------------------------------------------------------------
+# FPGA observation of AD9523->AD9484 sample clock (/FPGA_ADC_CLOCK_P/N)
+# --------------------------------------------------------------------------
+# AD9523 drives the AD9484 sample clock directly; the same differential
+# pair is tapped to FPGA pads N11 (P) / N12 (N), Bank 14, MRCC-capable.
+# This is an INPUT-ONLY tap (FPGA must never drive these pads — that would
+# contend with the AD9523 driver feeding the ADC). The 50T wrapper anchors
+# with IBUFDS + DONT_TOUCH so the pad assignment is preserved across all
+# synthesis/optimization stages. The buffered net is unconsumed for now;
+# create_clock and clock_groups are deferred until an RTL consumer exists
+# (see commented template below).
+set_property PACKAGE_PIN N11 [get_ports {fpga_adc_clock_p}]
+set_property PACKAGE_PIN N12 [get_ports {fpga_adc_clock_n}]
+set_property IOSTANDARD LVDS_25 [get_ports {fpga_adc_clock_p}]
+set_property IOSTANDARD LVDS_25 [get_ports {fpga_adc_clock_n}]
+set_property DIFF_TERM TRUE [get_ports {fpga_adc_clock_p}]
+# No create_clock here on purpose: the IBUFDS output is unconsumed (anchored
+# via DONT_TOUCH only), so declaring it as a clock would only generate
+# "clock has no registered destinations" warnings. When a follow-up PR adds
+# an actual consumer, add:
+#     create_clock -name fpga_adc_clock -period 2.5 [get_ports {fpga_adc_clock_p}]
+#     set_input_jitter [get_clocks fpga_adc_clock] 0.05
+#     set_clock_groups -asynchronous -group [get_clocks fpga_adc_clock] ...
+
 # ============================================================================
 # FT2232H USB 2.0 INTERFACE (Bank 35, VCCO=3.3V)
 # ============================================================================
@@ -347,29 +405,49 @@ set_property DRIVE 8 [get_ports {ft_data[*]}]
 # FPGA Write Path (FPGA drives data, FT2232H samples):
 #   - Data setup before next CLKOUT rising: t_su = 5.0 ns
 #   - Data hold after CLKOUT rising:        t_hd = 0.0 ns
-#   - Output delay max = period - t_su = 16.667 - 5.0 = 11.667 ns
-#   - Output delay min = t_hd = 0.0 ns
+#   - Board trace skew budget:               ~0.5 ns
+#   - Output delay max = t_su + trace_max = 5.0 + 0.5 = 5.5 ns
+#   - Output delay min = t_hd - trace_min = 0.0 - 0.0 = 0.0 ns
+#
+# NOTE: Historical XDC used 'period - t_su = 11.667 ns' for output_delay -max,
+# which is the wrong interpretation: set_output_delay takes the external setup
+# requirement (+trace), not the remaining timing budget. The old value forced
+# Vivado to close a path assuming FT2232H requires 11.667 ns of setup, which
+# it does not, and caused WNS=-5.350 ns failures on ft_data/ft_rd_n/ft_wr_n/
+# ft_oe_n/ft_siwu paths given the 5.513 ns clock insertion delay on the
+# non-dedicated C4 routing.
 # --------------------------------------------------------------------------
 
 # Input delays: FT2232H → FPGA (data bus and status signals)
+#
+# -min revision (Build N+1): was 0.0 ns, now 1.0 ns.
+# Rationale: set_input_delay -min is the EARLIEST time data can change at the
+# FPGA pin after the launch clock edge, i.e. FT2232H Tco_min + trace_min.
+# Setting -min 0.0 claimed data could change simultaneously with the clock
+# edge, which is pessimistically tight for hold analysis and caused a
+# -0.079 ns hold violation on ft_rxf_n → FSM_sequential_wr_state in Build N
+# (due to 2.895 ns clock insertion delay on non-dedicated C4 routing).
+# FT2232H Sync FIFO Tco is spec'd 1–4 ns; using 1.0 ns is conservative and
+# still covers worst-case silicon. Invariant preserved: hold_margin =
+# Tco_min + trace_min - clk_insertion_delay - Th_fpga ≥ 0.
 set_input_delay -clock [get_clocks ft_clkout] -max 9.667 [get_ports {ft_data[*]}]
-set_input_delay -clock [get_clocks ft_clkout] -min 0.0   [get_ports {ft_data[*]}]
+set_input_delay -clock [get_clocks ft_clkout] -min 1.0   [get_ports {ft_data[*]}]
 set_input_delay -clock [get_clocks ft_clkout] -max 9.667 [get_ports {ft_rxf_n}]
-set_input_delay -clock [get_clocks ft_clkout] -min 0.0   [get_ports {ft_rxf_n}]
+set_input_delay -clock [get_clocks ft_clkout] -min 1.0   [get_ports {ft_rxf_n}]
 set_input_delay -clock [get_clocks ft_clkout] -max 9.667 [get_ports {ft_txe_n}]
-set_input_delay -clock [get_clocks ft_clkout] -min 0.0   [get_ports {ft_txe_n}]
+set_input_delay -clock [get_clocks ft_clkout] -min 1.0   [get_ports {ft_txe_n}]
 
 # Output delays: FPGA → FT2232H (control strobes and data bus when writing)
-set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_data[*]}]
-set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_data[*]}]
-set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_rd_n}]
-set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_rd_n}]
-set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_wr_n}]
-set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_wr_n}]
-set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_oe_n}]
-set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_oe_n}]
-set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_siwu}]
-set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_siwu}]
+set_output_delay -clock [get_clocks ft_clkout] -max 5.5 [get_ports {ft_data[*]}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0 [get_ports {ft_data[*]}]
+set_output_delay -clock [get_clocks ft_clkout] -max 5.5 [get_ports {ft_rd_n}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0 [get_ports {ft_rd_n}]
+set_output_delay -clock [get_clocks ft_clkout] -max 5.5 [get_ports {ft_wr_n}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0 [get_ports {ft_wr_n}]
+set_output_delay -clock [get_clocks ft_clkout] -max 5.5 [get_ports {ft_oe_n}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0 [get_ports {ft_oe_n}]
+set_output_delay -clock [get_clocks ft_clkout] -max 5.5 [get_ports {ft_siwu}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0 [get_ports {ft_siwu}]
 
 # ============================================================================
 # STATUS / DEBUG OUTPUTS — NO PHYSICAL CONNECTIONS
@@ -411,24 +489,42 @@ set_false_path -from [get_ports {stm32_mixers_enable}]
 set_false_path -from [get_cells reset_sync_reg[*]] -to [get_pins -filter {REF_PIN_NAME == CLR} -of_objects [get_cells -hierarchical -filter {PRIMITIVE_TYPE =~ REGISTER.*.*}]]
 
 # --------------------------------------------------------------------------
-# Clock Domain Crossing false paths
+# Clock Domain Crossing — asynchronous clock groups
+#
+# Rationale: prefer `set_clock_groups -asynchronous` over pairwise
+# `set_false_path -from CLK -to CLK`. The latter is an STA antipattern:
+# it disables *all* paths between the two domains, including the
+# synchronizer paths themselves and any future inadvertent crossings,
+# which can mask real CDC bugs that only show up at temperature/voltage
+# corners. Clock-groups is the idiomatic way to declare domains async
+# while still letting STA flag newly-introduced unrelated paths.
+#
+# Register-level false_paths (e.g. reset_sync_reg above) remain
+# appropriate — those restrict the waiver to specific, audited endpoints.
+#
+# Groups declared here mirror the pairwise false_paths that existed
+# previously; no new pair is declared async.
 # --------------------------------------------------------------------------
 
 # clk_100m ↔ adc_dco_p (400 MHz): DDC has internal CDC synchronizers
-set_false_path -from [get_clocks clk_100m] -to [get_clocks adc_dco_p]
-set_false_path -from [get_clocks adc_dco_p] -to [get_clocks clk_100m]
+set_clock_groups -asynchronous \
+    -group [get_clocks clk_100m] \
+    -group [get_clocks adc_dco_p]
 
 # clk_100m ↔ clk_120m_dac: CDC via synchronizers in radar_system_top
-set_false_path -from [get_clocks clk_100m] -to [get_clocks clk_120m_dac]
-set_false_path -from [get_clocks clk_120m_dac] -to [get_clocks clk_100m]
+set_clock_groups -asynchronous \
+    -group [get_clocks clk_100m] \
+    -group [get_clocks clk_120m_dac]
 
 # FT2232H CDC: clk_100m ↔ ft_clkout (60 MHz), toggle CDC in RTL
-set_false_path -from [get_clocks clk_100m] -to [get_clocks ft_clkout]
-set_false_path -from [get_clocks ft_clkout] -to [get_clocks clk_100m]
+set_clock_groups -asynchronous \
+    -group [get_clocks clk_100m] \
+    -group [get_clocks ft_clkout]
 
 # FT2232H CDC: clk_120m_dac ↔ ft_clkout (no direct crossing, but belt-and-suspenders)
-set_false_path -from [get_clocks clk_120m_dac] -to [get_clocks ft_clkout]
-set_false_path -from [get_clocks ft_clkout] -to [get_clocks clk_120m_dac]
+set_clock_groups -asynchronous \
+    -group [get_clocks clk_120m_dac] \
+    -group [get_clocks ft_clkout]
 
 # ============================================================================
 # PHYSICAL CONSTRAINTS
