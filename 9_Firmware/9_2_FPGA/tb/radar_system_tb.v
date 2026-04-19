@@ -430,7 +430,13 @@ end
 // DUT INSTANTIATION
 // ============================================================================
 
-radar_system_top dut (
+radar_system_top #(
+`ifdef USB_MODE_1
+    .USB_MODE(1)  // FT2232H interface (production 50T board)
+`else
+    .USB_MODE(0)  // FT601 interface (200T dev board)
+`endif
+) dut (
     // System Clocks
     .clk_100m(clk_100m),
     .clk_120m_dac(clk_120m_dac),
@@ -619,7 +625,11 @@ initial begin
     // Optional: dump specific signals for debugging
     $dumpvars(1, dut.tx_inst);
     $dumpvars(1, dut.rx_inst);
+    `ifdef USB_MODE_1
     $dumpvars(1, dut.gen_ft2232h.usb_inst);
+    `else
+    $dumpvars(1, dut.gen_ft601.usb_inst);
+    `endif
 end
 
 endmodule

@@ -108,6 +108,9 @@ add_files -fileset constrs_1 -norecurse [file join $project_root "constraints" "
 
 set_property top $top_module [current_fileset]
 set_property verilog_define {FFT_XPM_BRAM} [current_fileset]
+# Override USB_MODE to 0 (FT601) for 200T premium board.
+# The RTL default is USB_MODE=1 (FT2232H, production 50T).
+set_property generic {USB_MODE=0} [current_fileset]
 
 # ==============================================================================
 # 2. Synthesis

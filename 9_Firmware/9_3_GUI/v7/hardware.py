@@ -25,6 +25,7 @@ if USB_AVAILABLE:
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from radar_protocol import (  # noqa: F401 — re-exported for v7 package
     FT2232HConnection,
+    FT601Connection,
     RadarProtocol,
     Opcode,
     RadarAcquisition,
@@ -46,8 +47,9 @@ class STM32USBInterface:
 
     Used ONLY for receiving GPS data from the MCU.
 
-    FPGA register commands are sent via FT2232H (see FT2232HConnection
-    from radar_protocol.py). The old send_start_flag() / send_settings()
+    FPGA register commands are sent via the USB data interface — either
+    FT2232HConnection (production) or FT601Connection (premium), both
+    from radar_protocol.py. The old send_start_flag() / send_settings()
     methods have been removed — they used an incompatible magic-packet
     protocol that the FPGA does not understand.
     """

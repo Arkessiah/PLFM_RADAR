@@ -26,6 +26,7 @@ from .models import (
 # Hardware interfaces — production protocol via radar_protocol.py
 from .hardware import (
     FT2232HConnection,
+    FT601Connection,
     RadarProtocol,
     Opcode,
     RadarAcquisition,
@@ -89,7 +90,7 @@ __all__ = [  # noqa: RUF022
     "USB_AVAILABLE", "FTDI_AVAILABLE", "SCIPY_AVAILABLE",
     "SKLEARN_AVAILABLE", "FILTERPY_AVAILABLE",
     # hardware — production FPGA protocol
-    "FT2232HConnection", "RadarProtocol", "Opcode",
+    "FT2232HConnection", "FT601Connection", "RadarProtocol", "Opcode",
     "RadarAcquisition", "RadarFrame", "StatusResponse", "DataRecorder",
     "STM32USBInterface",
     # processing

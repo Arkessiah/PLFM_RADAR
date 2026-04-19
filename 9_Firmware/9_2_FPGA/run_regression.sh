@@ -87,6 +87,33 @@ EXTRA_RTL=(
     frequency_matched_filter.v
 )
 
+# ---------------------------------------------------------------------------
+# Shared RTL file lists for integration / system tests
+# Centralised here so a new module only needs adding once.
+# ---------------------------------------------------------------------------
+
+# Receiver chain (used by golden generate/compare tests)
+RECEIVER_RTL=(
+    radar_receiver_final.v
+    radar_mode_controller.v
+    tb/ad9484_interface_400m_stub.v
+    ddc_400m.v nco_400m_enhanced.v cic_decimator_4x_enhanced.v
+    cdc_modules.v fir_lowpass.v ddc_input_interface.v
+    chirp_memory_loader_param.v latency_buffer.v
+    matched_filter_multi_segment.v matched_filter_processing_chain.v
+    range_bin_decimator.v doppler_processor.v xfft_16.v fft_engine.v
+    rx_gain_control.v mti_canceller.v
+)
+
+# Full system top (receiver chain + TX + USB + detection + self-test)
+SYSTEM_RTL=(
+    radar_system_top.v
+    radar_transmitter.v dac_interface_single.v plfm_chirp_controller.v
+    "${RECEIVER_RTL[@]}"
+    usb_data_interface.v usb_data_interface_ft2232h.v edge_detector.v
+    cfar_ca.v fpga_self_test.v
+)
+
 # ---- Layer A: iverilog -Wall compilation ----
 run_lint_iverilog() {
     local label="$1"
@@ -220,26 +247,9 @@ run_lint_static() {
         fi
     done
 
-    # --- Single-line regex checks across all production RTL ---
-    for f in "$@"; do
-        [[ -f "$f" ]] || continue
-        case "$f" in tb/*) continue ;; esac
-
-        local linenum=0
-        while IFS= read -r line; do
-            linenum=$((linenum + 1))
-
-            # CHECK 5: $readmemh / $readmemb in synthesizable code
-            # (Only valid in simulation blocks — flag if outside `ifdef SIMULATION)
-            # This is hard to check line-by-line without tracking ifdefs.
-            # Skip for v1.
-
-            # CHECK 6: Unused `include files (informational only)
-            # Skip for v1.
-
-            :  # placeholder — prevents empty loop body
-        done < "$f"
-    done
+    # CHECK 5 ($readmemh in synth code) and CHECK 6 (unused includes)
+    # require multi-line ifdef tracking / cross-file analysis. Not feasible
+    # with line-by-line regex. Omitted — use Vivado lint instead.
 
     if [[ "$err_count" -gt 0 ]]; then
         echo -e "${RED}FAIL${NC} ($err_count errors, $warn_count warnings)"
@@ -421,59 +431,36 @@ if [[ "$QUICK" -eq 0 ]]; then
     run_test "Receiver (golden generate)" \
         tb/tb_rx_golden_reg.vvp \
         -DGOLDEN_GENERATE \
-        tb/tb_radar_receiver_final.v radar_receiver_final.v \
-        radar_mode_controller.v tb/ad9484_interface_400m_stub.v \
-        ddc_400m.v nco_400m_enhanced.v cic_decimator_4x_enhanced.v \
-        cdc_modules.v fir_lowpass.v ddc_input_interface.v \
-        chirp_memory_loader_param.v latency_buffer.v \
-        matched_filter_multi_segment.v matched_filter_processing_chain.v \
-        range_bin_decimator.v doppler_processor.v xfft_16.v fft_engine.v \
-        rx_gain_control.v mti_canceller.v
+        tb/tb_radar_receiver_final.v "${RECEIVER_RTL[@]}"
 
     # Golden compare
     run_test "Receiver (golden compare)" \
         tb/tb_rx_compare_reg.vvp \
-        tb/tb_radar_receiver_final.v radar_receiver_final.v \
-        radar_mode_controller.v tb/ad9484_interface_400m_stub.v \
-        ddc_400m.v nco_400m_enhanced.v cic_decimator_4x_enhanced.v \
-        cdc_modules.v fir_lowpass.v ddc_input_interface.v \
-        chirp_memory_loader_param.v latency_buffer.v \
-        matched_filter_multi_segment.v matched_filter_processing_chain.v \
-        range_bin_decimator.v doppler_processor.v xfft_16.v fft_engine.v \
-        rx_gain_control.v mti_canceller.v
+        tb/tb_radar_receiver_final.v "${RECEIVER_RTL[@]}"
 
     # Full system top (monitoring-only, legacy)
     run_test "System Top (radar_system_tb)" \
         tb/tb_system_reg.vvp \
-        tb/radar_system_tb.v radar_system_top.v \
-        radar_transmitter.v dac_interface_single.v plfm_chirp_controller.v \
-        radar_receiver_final.v tb/ad9484_interface_400m_stub.v \
-        ddc_400m.v nco_400m_enhanced.v cic_decimator_4x_enhanced.v \
-        cdc_modules.v fir_lowpass.v ddc_input_interface.v \
-        chirp_memory_loader_param.v latency_buffer.v \
-        matched_filter_multi_segment.v matched_filter_processing_chain.v \
-        range_bin_decimator.v doppler_processor.v xfft_16.v fft_engine.v \
-        usb_data_interface.v usb_data_interface_ft2232h.v \
-        edge_detector.v radar_mode_controller.v \
-        rx_gain_control.v cfar_ca.v mti_canceller.v fpga_self_test.v
+        tb/radar_system_tb.v "${SYSTEM_RTL[@]}"
 
     # E2E integration (46 strict checks: TX, RX, USB R/W, CDC, safety, reset)
     run_test "System E2E (tb_system_e2e)" \
         tb/tb_system_e2e_reg.vvp \
-        tb/tb_system_e2e.v radar_system_top.v \
-        radar_transmitter.v dac_interface_single.v plfm_chirp_controller.v \
-        radar_receiver_final.v tb/ad9484_interface_400m_stub.v \
-        ddc_400m.v nco_400m_enhanced.v cic_decimator_4x_enhanced.v \
-        cdc_modules.v fir_lowpass.v ddc_input_interface.v \
-        chirp_memory_loader_param.v latency_buffer.v \
-        matched_filter_multi_segment.v matched_filter_processing_chain.v \
-        range_bin_decimator.v doppler_processor.v xfft_16.v fft_engine.v \
-        usb_data_interface.v usb_data_interface_ft2232h.v \
-        edge_detector.v radar_mode_controller.v \
-        rx_gain_control.v cfar_ca.v mti_canceller.v fpga_self_test.v
+        tb/tb_system_e2e.v "${SYSTEM_RTL[@]}"
+
+    # USB_MODE=1 (FT2232H production) variants of system tests
+    run_test "System Top USB_MODE=1 (FT2232H)" \
+        tb/tb_system_ft2232h_reg.vvp \
+        -DUSB_MODE_1 \
+        tb/radar_system_tb.v "${SYSTEM_RTL[@]}"
+
+    run_test "System E2E USB_MODE=1 (FT2232H)" \
+        tb/tb_system_e2e_ft2232h_reg.vvp \
+        -DUSB_MODE_1 \
+        tb/tb_system_e2e.v "${SYSTEM_RTL[@]}"
 else
     echo "  (skipped receiver golden + system top + E2E — use without --quick)"
-    SKIP=$((SKIP + 4))
+    SKIP=$((SKIP + 6))
 fi
 
 echo ""

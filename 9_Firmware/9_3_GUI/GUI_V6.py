@@ -1,3 +1,9 @@
+# =============================================================================
+# DEPRECATED: GUI V6 is superseded by GUI_V65_Tk (tkinter) and V7 (PyQt6).
+# This file is retained for reference only. Do not use for new development.
+# Removal planned for next major release.
+# =============================================================================
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading

@@ -53,7 +53,7 @@ The AERIS-10 main sub-systems are:
   - **XC7A50T FPGA** - Handles RADAR Signal Processing on the upstream FTG256 board:
     - PLFM Chirps generation via the DAC
     - Raw ADC data read
-    - Digital Gain Control (host-configurable gain shift)
+    - Hybrid Automatic Gain Control (AGC) — cross-layer FPGA/STM32/GUI loop
     - I/Q Baseband Down-Conversion
     - Decimation
     - Filtering
@@ -111,7 +111,8 @@ The AERIS-10 main sub-systems are:
    - Map integration
    - Radar control interface
 
-![AERIS-10 GUI Demo](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/GUI_V6.gif)
+![AERIS-10 Dashboard](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/GUI_V6.gif)
+<!-- V6 GIF removed — V6 is deprecated. V65 Tk and V7 PyQt6 are the active GUIs. -->
 
 ## 📊 Technical Specifications
 

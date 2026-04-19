@@ -32,8 +32,8 @@ the `USB_MODE` parameter in `radar_system_top.v`:
 
 | USB_MODE | Interface | Bus Width | Speed | Board Target |
 |----------|-----------|-----------|-------|--------------|
-| 0 (default) | FT601 (USB 3.0) | 32-bit | 100 MHz | 200T premium dev board |
-| 1 | FT2232H (USB 2.0) | 8-bit | 60 MHz | 50T production board |
+| 0 | FT601 (USB 3.0) | 32-bit | 100 MHz | 200T premium dev board |
+| 1 (default) | FT2232H (USB 2.0) | 8-bit | 60 MHz | 50T production board |
 
 ### How USB_MODE Works
 
@@ -72,7 +72,8 @@ The parameter is set via a **wrapper module** that overrides the default:
   ```
 
 - **200T dev board**: `radar_system_top` is used directly as the top module.
-  `USB_MODE` defaults to `0` (FT601). No wrapper needed.
+  `USB_MODE` defaults to `1` (FT2232H) since production is the primary target.
+  Override with `.USB_MODE(0)` for FT601 builds.
 
 ### RTL Files by USB Interface
 
@@ -158,7 +159,7 @@ The build scripts automatically select the correct top module and constraints:
 
 You do NOT need to set `USB_MODE` manually. The top module selection handles it:
 - `radar_system_top_50t` forces `USB_MODE=1` internally
-- `radar_system_top` defaults to `USB_MODE=0`
+- `radar_system_top` defaults to `USB_MODE=1` (FT2232H, production default)
 
 ## How to Select Constraints in Vivado
 
@@ -190,9 +191,9 @@ read_xdc constraints/te0713_te0701_minimal.xdc
 | Target | Top module | USB_MODE | USB Interface | Notes |
 |--------|------------|----------|---------------|-------|
 | 50T Production (FTG256) | `radar_system_top_50t` | 1 | FT2232H (8-bit) | Wrapper sets USB_MODE=1, ties off FT601 |
-| 200T Dev (FBG484) | `radar_system_top` | 0 (default) | FT601 (32-bit) | No wrapper needed |
-| Trenz TE0712/TE0701 | `radar_system_top_te0712_dev` | 0 (default) | FT601 (32-bit) | Minimal bring-up wrapper |
-| Trenz TE0713/TE0701 | `radar_system_top_te0713_dev` | 0 (default) | FT601 (32-bit) | Alternate SoM wrapper |
+| 200T Dev (FBG484) | `radar_system_top` | 0 (override) | FT601 (32-bit) | Build script overrides default USB_MODE=1 |
+| Trenz TE0712/TE0701 | `radar_system_top_te0712_dev` | 0 (override) | FT601 (32-bit) | Minimal bring-up wrapper |
+| Trenz TE0713/TE0701 | `radar_system_top_te0713_dev` | 0 (override) | FT601 (32-bit) | Alternate SoM wrapper |
 
 ## Trenz Split Status
 

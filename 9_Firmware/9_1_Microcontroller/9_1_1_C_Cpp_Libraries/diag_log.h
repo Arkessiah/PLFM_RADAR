@@ -112,7 +112,7 @@ extern "C" {
  *   "BF"    -- ADAR1000 beamformer
  *   "PA"    -- Power amplifier bias/monitoring
  *   "FPGA"  -- FPGA communication and handshake
- *   "USB"   -- FT601 USB data path
+ *   "USB"   -- USB data path (FT2232H production / FT601 premium)
  *   "PWR"   -- Power sequencing and rail monitoring
  *   "IMU"   -- IMU/GPS/barometer sensors
  *   "MOT"   -- Stepper motor/scan mechanics

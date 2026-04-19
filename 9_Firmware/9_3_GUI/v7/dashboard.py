@@ -13,13 +13,14 @@ RadarDashboard is a QMainWindow with six tabs:
   6. Settings    — Host-side DSP parameters + About section
 
 Uses production radar_protocol.py for all FPGA communication:
-  - FT2232HConnection for real hardware
+  - FT2232HConnection for production board (FT2232H USB 2.0)
+  - FT601Connection for premium board (FT601 USB 3.0) — selectable from GUI
   - Unified replay via SoftwareFPGA + ReplayEngine + ReplayWorker
   - Mock mode (FT2232HConnection(mock=True)) for development
 
 The old STM32 magic-packet start flow has been removed. FPGA registers
 are controlled directly via 4-byte {opcode, addr, value_hi, value_lo}
-commands sent over FT2232H.
+commands sent over FT2232H or FT601.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from .models import (
 )
 from .hardware import (
     FT2232HConnection,
+    FT601Connection,
     RadarProtocol,
     RadarFrame,
     StatusResponse,
@@ -142,7 +144,7 @@ class RadarDashboard(QMainWindow):
         )
 
         # Hardware interfaces — production protocol
-        self._connection: FT2232HConnection | None = None
+        self._connection: FT2232HConnection | FT601Connection | None = None
         self._stm32 = STM32USBInterface()
         self._recorder = DataRecorder()
 
@@ -364,7 +366,7 @@ class RadarDashboard(QMainWindow):
         # Row 0: connection mode + device combos + buttons
         ctrl_layout.addWidget(QLabel("Mode:"), 0, 0)
         self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["Mock", "Live FT2232H", "Replay"])
+        self._mode_combo.addItems(["Mock", "Live", "Replay"])
         self._mode_combo.setCurrentIndex(0)
         ctrl_layout.addWidget(self._mode_combo, 0, 1)
 
@@ -376,6 +378,13 @@ class RadarDashboard(QMainWindow):
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._refresh_devices)
         ctrl_layout.addWidget(refresh_btn, 0, 4)
+
+        # USB Interface selector (production FT2232H / premium FT601)
+        ctrl_layout.addWidget(QLabel("USB Interface:"), 0, 5)
+        self._usb_iface_combo = QComboBox()
+        self._usb_iface_combo.addItems(["FT2232H (Production)", "FT601 (Premium)"])
+        self._usb_iface_combo.setCurrentIndex(0)
+        ctrl_layout.addWidget(self._usb_iface_combo, 0, 6)
 
         self._start_btn = QPushButton("Start Radar")
         self._start_btn.setStyleSheet(
@@ -1001,7 +1010,8 @@ class RadarDashboard(QMainWindow):
         self._conn_ft2232h = self._make_status_label("FT2232H")
         self._conn_stm32 = self._make_status_label("STM32 USB")
 
-        conn_layout.addWidget(QLabel("FT2232H:"), 0, 0)
+        self._conn_usb_label = QLabel("USB Data:")
+        conn_layout.addWidget(self._conn_usb_label, 0, 0)
         conn_layout.addWidget(self._conn_ft2232h, 0, 1)
         conn_layout.addWidget(QLabel("STM32 USB:"), 1, 0)
         conn_layout.addWidget(self._conn_stm32, 1, 1)
@@ -1167,7 +1177,7 @@ class RadarDashboard(QMainWindow):
         about_lbl = QLabel(
             "<b>AERIS-10 Radar System V7</b><br>"
             "PyQt6 Edition with Embedded Leaflet Map<br><br>"
-            "<b>Data Interface:</b> FT2232H USB 2.0 (production protocol)<br>"
+            "<b>Data Interface:</b> FT2232H USB 2.0 (production) / FT601 USB 3.0 (premium)<br>"
             "<b>FPGA Protocol:</b> 4-byte register commands, 0xAA/0xBB packets<br>"
             "<b>Map:</b> OpenStreetMap + Leaflet.js<br>"
             "<b>Framework:</b> PyQt6 + QWebEngine<br>"
@@ -1224,7 +1234,7 @@ class RadarDashboard(QMainWindow):
     # =====================================================================
 
     def _send_fpga_cmd(self, opcode: int, value: int):
-        """Send a 4-byte register command to the FPGA via FT2232H."""
+        """Send a 4-byte register command to the FPGA via USB (FT2232H or FT601)."""
         if self._connection is None or not self._connection.is_open:
             logger.warning(f"Cannot send 0x{opcode:02X}={value}: no connection")
             return
@@ -1287,16 +1297,26 @@ class RadarDashboard(QMainWindow):
 
             if "Mock" in mode:
                 self._replay_mode = False
-                self._connection = FT2232HConnection(mock=True)
+                iface = self._usb_iface_combo.currentText()
+                if "FT601" in iface:
+                    self._connection = FT601Connection(mock=True)
+                else:
+                    self._connection = FT2232HConnection(mock=True)
                 if not self._connection.open():
                     QMessageBox.critical(self, "Error", "Failed to open mock connection.")
                     return
             elif "Live" in mode:
                 self._replay_mode = False
-                self._connection = FT2232HConnection(mock=False)
+                iface = self._usb_iface_combo.currentText()
+                if "FT601" in iface:
+                    self._connection = FT601Connection(mock=False)
+                    iface_name = "FT601"
+                else:
+                    self._connection = FT2232HConnection(mock=False)
+                    iface_name = "FT2232H"
                 if not self._connection.open():
                     QMessageBox.critical(self, "Error",
-                                         "Failed to open FT2232H. Check USB connection.")
+                                         f"Failed to open {iface_name}. Check USB connection.")
                     return
             elif "Replay" in mode:
                 self._replay_mode = True
@@ -1368,6 +1388,7 @@ class RadarDashboard(QMainWindow):
                 self._start_btn.setEnabled(False)
                 self._stop_btn.setEnabled(True)
                 self._mode_combo.setEnabled(False)
+                self._usb_iface_combo.setEnabled(False)
                 self._demo_btn_main.setEnabled(False)
                 self._demo_btn_map.setEnabled(False)
                 n_frames = self._replay_engine.total_frames
@@ -1417,6 +1438,7 @@ class RadarDashboard(QMainWindow):
             self._start_btn.setEnabled(False)
             self._stop_btn.setEnabled(True)
             self._mode_combo.setEnabled(False)
+            self._usb_iface_combo.setEnabled(False)
             self._demo_btn_main.setEnabled(False)
             self._demo_btn_map.setEnabled(False)
             self._status_label_main.setText(f"Status: Running ({mode})")
@@ -1462,6 +1484,7 @@ class RadarDashboard(QMainWindow):
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._mode_combo.setEnabled(True)
+        self._usb_iface_combo.setEnabled(True)
         self._demo_btn_main.setEnabled(True)
         self._demo_btn_map.setEnabled(True)
         self._status_label_main.setText("Status: Radar stopped")
@@ -1953,6 +1976,12 @@ class RadarDashboard(QMainWindow):
         conn_open = (self._connection is not None and self._connection.is_open)
         self._set_conn_indicator(self._conn_ft2232h, conn_open)
         self._set_conn_indicator(self._conn_stm32, self._stm32.is_open)
+
+        # Update USB label to reflect which interface is active
+        if isinstance(self._connection, FT601Connection):
+            self._conn_usb_label.setText("FT601:")
+        else:
+            self._conn_usb_label.setText("FT2232H:")
 
         gps_count = self._gps_packet_count
         if self._gps_worker:

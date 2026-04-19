@@ -382,7 +382,13 @@ end
 // ============================================================================
 // DUT INSTANTIATION
 // ============================================================================
-radar_system_top dut (
+radar_system_top #(
+`ifdef USB_MODE_1
+    .USB_MODE(1)  // FT2232H interface (production 50T board)
+`else
+    .USB_MODE(0)  // FT601 interface (200T dev board)
+`endif
+) dut (
     .clk_100m(clk_100m),
     .clk_120m_dac(clk_120m_dac),
     .ft601_clk_in(ft601_clk_in),
@@ -554,10 +560,10 @@ initial begin
     do_reset;
 
     // CRITICAL: Configure stream control to range-only BEFORE any chirps
-    // fire. The USB write FSM blocks on doppler_valid_ft if doppler stream
-    // is enabled but no Doppler data arrives (needs 32 chirps/frame).
-    // Without this, the write FSM deadlocks and the read FSM can never
-    // activate (it requires write FSM == IDLE).
+    // fire. The USB write FSM gates on pending flags: if doppler stream is
+    // enabled but no Doppler data arrives (needs 32 chirps/frame), the FSM
+    // stays in IDLE waiting for doppler_data_pending. With the write FSM
+    // not in IDLE, the read FSM cannot activate (bus arbitration rule).
     bfm_send_cmd(8'h04, 8'h00, 16'h0001);  // stream_control = range only
     // Wait for stream_control CDC to propagate (2-stage sync in ft601_clk)
     // Must be long enough that stream_ctrl_sync_1 is updated before any
@@ -778,7 +784,7 @@ initial begin
 
     // Restore defaults for subsequent tests
     bfm_send_cmd(8'h01, 8'h00, 16'h0001);  // mode = auto-scan
-    bfm_send_cmd(8'h04, 8'h00, 16'h0001);  // keep range-only (prevents write FSM deadlock)
+    bfm_send_cmd(8'h04, 8'h00, 16'h0001);  // keep range-only (TB lacks 32-chirp doppler data)
     bfm_send_cmd(8'h10, 8'h00, 16'd3000);  // restore long chirp cycles
 
     $display("");
@@ -913,7 +919,7 @@ initial begin
     // Need to re-send configuration since reset clears all registers
     stm32_mixers_enable = 1;
     ft601_txe = 0;
-    bfm_send_cmd(8'h04, 8'h00, 16'h0001);  // stream_control = range only (prevent deadlock)
+    bfm_send_cmd(8'h04, 8'h00, 16'h0001);  // stream_control = range only (TB lacks doppler data)
     #500;  // Wait for stream_control CDC
     bfm_send_cmd(8'h01, 8'h00, 16'h0001);  // auto-scan
     bfm_send_cmd(8'h10, 8'h00, 16'd100);   // short timing
@@ -947,7 +953,7 @@ initial begin
     check(dut.host_stream_control == 3'b000,
           "G10.2: All streams disabled (stream_control = 3'b000)");
 
-    // G10.3: Re-enable range only (keep range-only to prevent write FSM deadlock)
+    // G10.3: Re-enable range only (TB uses range-only — no doppler processing)
     bfm_send_cmd(8'h04, 8'h00, 16'h0001);  // stream_control = 3'b001
     check(dut.host_stream_control == 3'b001,
           "G10.3: Range stream re-enabled (stream_control = 3'b001)");

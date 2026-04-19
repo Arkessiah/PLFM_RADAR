@@ -620,8 +620,10 @@ module tb_cross_layer_ft2232h;
               "Data pkt: byte 7 = 0x56 (doppler_imag MSB)");
         check(captured_bytes[8] === 8'h78,
               "Data pkt: byte 8 = 0x78 (doppler_imag LSB)");
-        check(captured_bytes[9] === 8'h01,
-              "Data pkt: byte 9 = 0x01 (cfar_detection=1)");
+        // Byte 9 = {frame_start, 6'b0, cfar_detection}
+        // After reset sample_counter==0, so frame_start=1 → 0x81
+        check(captured_bytes[9] === 8'h81,
+              "Data pkt: byte 9 = 0x81 (frame_start=1, cfar_detection=1)");
         check(captured_bytes[10] === 8'h55,
               "Data pkt: byte 10 = 0x55 (footer)");
 

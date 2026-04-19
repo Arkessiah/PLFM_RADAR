@@ -334,7 +334,7 @@ class TargetSimulator(QObject):
             self._add_random_target()
 
     def _add_random_target(self):
-        range_m = random.uniform(5000, 40000)
+        range_m = random.uniform(50, 1400)
         azimuth = random.uniform(0, 360)
         velocity = random.uniform(-100, 100)
         elevation = random.uniform(-5, 45)
@@ -368,7 +368,7 @@ class TargetSimulator(QObject):
 
         for t in self._targets:
             new_range = t.range - t.velocity * 0.5
-            if new_range < 500 or new_range > 50000:
+            if new_range < 10 or new_range > 1536:
                 continue  # target exits coverage — drop it
 
             new_vel = max(-150, min(150, t.velocity + random.uniform(-2, 2)))

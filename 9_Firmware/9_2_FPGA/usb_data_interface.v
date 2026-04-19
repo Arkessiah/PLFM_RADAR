@@ -1,3 +1,17 @@
+/**
+ * usb_data_interface.v
+ *
+ * FT601 USB 3.0 SuperSpeed FIFO Interface (32-bit bus, 100 MHz ft601_clk).
+ * Used on the 200T premium dev board. Production 50T board uses
+ * usb_data_interface_ft2232h.v (FT2232H, 8-bit, 60 MHz) instead.
+ *
+ * USB disconnect recovery:
+ *   A clock-activity watchdog in the clk domain detects when ft601_clk_in
+ *   stops (USB cable unplugged). After ~0.65 ms of silence (65536 system
+ *   clocks) it asserts ft601_clk_lost, which is OR'd into the FT-domain
+ *   reset so FSMs and FIFOs return to a clean state. When ft601_clk_in
+ *   resumes, a 2-stage reset synchronizer deasserts the reset cleanly.
+ */
 module usb_data_interface (
     input wire clk,              // Main clock (100MHz recommended)
     input wire reset_n,
@@ -15,13 +29,18 @@ module usb_data_interface (
     // FT601 Interface (Slave FIFO mode)
     // Data bus
     inout wire [31:0] ft601_data,    // 32-bit bidirectional data bus
-    output reg [3:0] ft601_be,       // Byte enable (4 lanes for 32-bit mode)
+    output reg [3:0] ft601_be,       // Byte enable (active-HIGH per DS_FT600Q-FT601Q Table 3.2)
     
     // Control signals
-    output reg ft601_txe_n,          // Transmit enable (active low)
-    output reg ft601_rxf_n,          // Receive enable (active low)
-    input wire ft601_txe,             // TXE: Transmit FIFO Not Full (high = space available to write)
-    input wire ft601_rxf,             // RXF: Receive FIFO Not Empty (high = data available to read)
+    // VESTIGIAL OUTPUTS — kept for 200T board port compatibility.
+    // On the 200T, these are constrained to physical pins G21 (TXE) and
+    // G22 (RXF) in xc7a200t_fbg484.xdc. Removing them from the RTL would
+    // break the 200T build. They are reset to 1 and never driven; the
+    // actual FT601 flow-control inputs are ft601_txe and ft601_rxf below.
+    output reg ft601_txe_n,          // VESTIGIAL: unused output, always 1
+    output reg ft601_rxf_n,          // VESTIGIAL: unused output, always 1
+    input wire ft601_txe,             // TXE: Transmit FIFO Not Full (active-low: 0 = space available)
+    input wire ft601_rxf,             // RXF: Receive FIFO Not Empty (active-low: 0 = data available)
     output reg ft601_wr_n,            // Write strobe (active low)
     output reg ft601_rd_n,            // Read strobe (active low)
     output reg ft601_oe_n,            // Output enable (active low)
@@ -97,20 +116,25 @@ localparam FT601_BURST_SIZE = 512;    // Max burst size in bytes
 // ============================================================================
 // WRITE FSM State definitions (Verilog-2001 compatible)
 // ============================================================================
-localparam [2:0] IDLE                = 3'd0,
-                 SEND_HEADER         = 3'd1,
-                 SEND_RANGE_DATA     = 3'd2,
-                 SEND_DOPPLER_DATA   = 3'd3,
-                 SEND_DETECTION_DATA = 3'd4,
-                 SEND_FOOTER         = 3'd5,
-                 WAIT_ACK            = 3'd6,
-                 SEND_STATUS         = 3'd7;  // Gap 2: status readback
+// Rewritten: data packet is now 3 x 32-bit writes (11 payload bytes + 1 pad).
+// Word 0: {HEADER, range[31:24], range[23:16], range[15:8]}  BE=1111
+// Word 1: {range[7:0], doppler_real[15:8], doppler_real[7:0], doppler_imag[15:8]} BE=1111
+// Word 2: {doppler_imag[7:0], detection, FOOTER, 8'h00}      BE=1110
+localparam [3:0] IDLE                = 4'd0,
+                 SEND_DATA_WORD      = 4'd1,
+                 SEND_STATUS         = 4'd2,
+                 WAIT_ACK            = 4'd3;
 
-reg [2:0] current_state;
-reg [7:0] byte_counter;
-reg [31:0] data_buffer;
+reg [3:0] current_state;
+reg [1:0] data_word_idx;     // 0..2 for 3-word data packet
 reg [31:0] ft601_data_out;
 reg ft601_data_oe;  // Output enable for bidirectional data bus
+
+// Pre-packed data words (registered snapshot of CDC'd data)
+reg [31:0] data_pkt_word0;
+reg [31:0] data_pkt_word1;
+reg [31:0] data_pkt_word2;
+reg [3:0]  data_pkt_be2;     // BE for last word (BE=1110 since byte 3 is pad)
 
 // ============================================================================
 // READ FSM State definitions (Gap 4: USB Read Path)
@@ -184,6 +208,67 @@ always @(posedge clk or negedge reset_n) begin
     end
 end
 
+// ============================================================================
+// CLOCK-ACTIVITY WATCHDOG (clk domain)
+// ============================================================================
+// Detects when ft601_clk_in stops (USB cable unplugged). A toggle register
+// in the ft601_clk domain flips every edge. The clk domain synchronizes it
+// and checks for transitions. If no transition is seen for 2^16 = 65536
+// clk cycles (~0.65 ms at 100 MHz), ft601_clk_lost asserts.
+
+// Toggle register: flips every ft601_clk edge (ft601_clk domain)
+reg ft601_heartbeat;
+always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
+    if (!ft601_reset_n)
+        ft601_heartbeat <= 1'b0;
+    else
+        ft601_heartbeat <= ~ft601_heartbeat;
+end
+
+// Synchronize heartbeat into clk domain (2-stage)
+(* ASYNC_REG = "TRUE" *) reg [1:0] ft601_hb_sync;
+reg ft601_hb_prev;
+reg [15:0] ft601_clk_timeout;
+reg ft601_clk_lost;
+
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        ft601_hb_sync    <= 2'b00;
+        ft601_hb_prev    <= 1'b0;
+        ft601_clk_timeout <= 16'd0;
+        ft601_clk_lost   <= 1'b0;
+    end else begin
+        ft601_hb_sync <= {ft601_hb_sync[0], ft601_heartbeat};
+        ft601_hb_prev <= ft601_hb_sync[1];
+
+        if (ft601_hb_sync[1] != ft601_hb_prev) begin
+            // ft601_clk is alive — reset counter, clear lost flag
+            ft601_clk_timeout <= 16'd0;
+            ft601_clk_lost    <= 1'b0;
+        end else if (!ft601_clk_lost) begin
+            if (ft601_clk_timeout == 16'hFFFF)
+                ft601_clk_lost <= 1'b1;
+            else
+                ft601_clk_timeout <= ft601_clk_timeout + 16'd1;
+        end
+    end
+end
+
+// Effective FT601-domain reset: asserted by global reset OR clock loss.
+// Deassertion synchronized to ft601_clk via 2-stage sync to avoid
+// metastability on the recovery edge.
+(* ASYNC_REG = "TRUE" *) reg [1:0] ft601_reset_sync;
+wire ft601_reset_raw_n = ft601_reset_n & ~ft601_clk_lost;
+
+always @(posedge ft601_clk_in or negedge ft601_reset_raw_n) begin
+    if (!ft601_reset_raw_n)
+        ft601_reset_sync <= 2'b00;
+    else
+        ft601_reset_sync <= {ft601_reset_sync[0], 1'b1};
+end
+
+wire ft601_effective_reset_n = ft601_reset_sync[1];
+
 // FT601-domain captured data (sampled from holding regs on sync'd edge)
 reg [31:0] range_profile_cap;
 reg [15:0] doppler_real_cap;
@@ -196,6 +281,18 @@ reg cfar_detection_cap;
 // a stream's valid hasn't fired yet (e.g., Doppler needs 32 chirps).
 reg doppler_data_pending;
 reg cfar_data_pending;
+
+// 1-cycle delayed range trigger.  range_valid_ft fires on the same clock
+// edge that range_profile_cap is captured (non-blocking).  If the FSM
+// reads range_profile_cap on that same edge it sees the STALE value.
+// Delaying the trigger by one cycle guarantees the capture register has
+// settled before the FSM packs the data words.
+reg range_data_ready;
+
+// Frame sync: sample counter (ft601_clk domain, wraps at NUM_CELLS)
+// Bit 7 of detection byte is set when sample_counter == 0 (frame start).
+localparam [11:0] NUM_CELLS = 12'd2048;  // 64 range x 32 doppler
+reg [11:0] sample_counter;
 
 // Gap 2: CDC for stream_control (clk_100m -> ft601_clk_in)
 // stream_control changes infrequently (only on host USB command), so
@@ -228,8 +325,8 @@ wire range_valid_ft;
 wire doppler_valid_ft;
 wire cfar_valid_ft;
 
-always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
-    if (!ft601_reset_n) begin
+always @(posedge ft601_clk_in or negedge ft601_effective_reset_n) begin
+    if (!ft601_effective_reset_n) begin
         range_valid_sync   <= 2'b00;
         doppler_valid_sync <= 2'b00;
         cfar_valid_sync    <= 2'b00;
@@ -240,6 +337,7 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
         doppler_real_cap   <= 16'd0;
         doppler_imag_cap   <= 16'd0;
         cfar_detection_cap <= 1'b0;
+        range_data_ready   <= 1'b0;
         // Fix #5: Default to range-only on reset (prevents write FSM deadlock)
         stream_ctrl_sync_0 <= 3'b001;
         stream_ctrl_sync_1 <= 3'b001;
@@ -276,7 +374,7 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
             // Word 4: AGC metrics + range_mode
             status_words[4] <= {status_agc_current_gain,        // [31:28]
                                 status_agc_peak_magnitude,      // [27:20]
-                                status_agc_saturation_count,    // [19:12]
+                                status_agc_saturation_count,    // [19:12] 8-bit saturation count
                                 status_agc_enable,              // [11]
                                 9'd0,                           // [10:2] reserved
                                 status_range_mode};             // [1:0]
@@ -302,6 +400,10 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
         if (cfar_valid_sync[1] && !cfar_valid_sync_d) begin
             cfar_detection_cap <= cfar_detection_hold;
         end
+
+        // 1-cycle delayed trigger: ensures range_profile_cap has settled
+        // before the FSM reads it for word packing.
+        range_data_ready <= range_valid_ft;
     end
 end
 
@@ -314,11 +416,11 @@ assign cfar_valid_ft    = cfar_valid_sync[1]     && !cfar_valid_sync_d;
 // FT601 data bus direction control
 assign ft601_data = ft601_data_oe ? ft601_data_out : 32'hzzzz_zzzz;
 
-always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
-    if (!ft601_reset_n) begin
+always @(posedge ft601_clk_in or negedge ft601_effective_reset_n) begin
+    if (!ft601_effective_reset_n) begin
         current_state <= IDLE;
         read_state <= RD_IDLE;
-        byte_counter <= 0;
+        data_word_idx <= 2'd0;
         ft601_data_out <= 0;
         ft601_data_oe <= 0;
         ft601_be <= 4'b1111;  // All bytes enabled for 32-bit mode
@@ -336,6 +438,11 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
         cmd_value <= 16'd0;
         doppler_data_pending <= 1'b0;
         cfar_data_pending <= 1'b0;
+        data_pkt_word0 <= 32'd0;
+        data_pkt_word1 <= 32'd0;
+        data_pkt_word2 <= 32'd0;
+        data_pkt_be2   <= 4'b1110;
+        sample_counter <= 12'd0;
         // NOTE: ft601_clk_out is driven by the clk-domain always block below.
         // Do NOT assign it here (ft601_clk_in domain) — causes multi-driven net.
     end else begin
@@ -424,122 +531,64 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
                         current_state <= SEND_STATUS;
                         status_word_idx <= 3'd0;
                     end
-                    // Trigger write FSM on range_valid edge (primary data source).
-                    // Doppler/cfar data_pending flags are checked inside
-                    // SEND_DOPPLER_DATA and SEND_DETECTION_DATA to skip or send.
-                    // Do NOT trigger on pending flags alone — they're sticky and
-                    // would cause repeated packet starts without new range data.
-                    else if (range_valid_ft && stream_range_en) begin
+                    // Trigger on range_data_ready (1 cycle after range_valid_ft)
+                    // so that range_profile_cap has settled from the CDC block.
+                    // Gate on pending flags: only send when all enabled
+                    // streams have fresh data (avoids stale doppler/CFAR)
+                    else if (range_data_ready && stream_range_en
+                             && (!stream_doppler_en || doppler_data_pending)
+                             && (!stream_cfar_en    || cfar_data_pending)) begin
                         // Don't start write if a read is about to begin
                         if (ft601_rxf) begin  // rxf=1 means no host data pending
-                            current_state <= SEND_HEADER;
-                            byte_counter <= 0;
+                            // Pack 11-byte data packet into 3 x 32-bit words
+                            // Doppler fields zeroed when stream disabled
+                            // CFAR field zeroed when stream disabled
+                            data_pkt_word0 <= {HEADER,
+                                               range_profile_cap[31:24],
+                                               range_profile_cap[23:16],
+                                               range_profile_cap[15:8]};
+                            data_pkt_word1 <= {range_profile_cap[7:0],
+                                               stream_doppler_en ? doppler_real_cap[15:8] : 8'd0,
+                                               stream_doppler_en ? doppler_real_cap[7:0]  : 8'd0,
+                                               stream_doppler_en ? doppler_imag_cap[15:8] : 8'd0};
+                            data_pkt_word2 <= {stream_doppler_en ? doppler_imag_cap[7:0]  : 8'd0,
+                                               stream_cfar_en
+                                                    ? {(sample_counter == 12'd0), 6'b0, cfar_detection_cap}
+                                                    : {(sample_counter == 12'd0), 7'd0},
+                                               FOOTER,
+                                               8'h00};  // pad byte
+                            data_pkt_be2   <= 4'b1110;   // 3 valid bytes + 1 pad
+                            data_word_idx  <= 2'd0;
+                            current_state  <= SEND_DATA_WORD;
                         end
                     end
                 end
-                
-                SEND_HEADER: begin
-                    if (!ft601_txe) begin  // FT601 TX FIFO not empty
-                        ft601_data_oe <= 1;
-                        ft601_data_out <= {24'b0, HEADER};
-                        ft601_be <= 4'b0001;  // Only lower byte valid
-                        ft601_wr_n <= 0;     // Assert write strobe
-                        // Gap 2: skip to first enabled stream
-                        if (stream_range_en)
-                            current_state <= SEND_RANGE_DATA;
-                        else if (stream_doppler_en)
-                            current_state <= SEND_DOPPLER_DATA;
-                        else if (stream_cfar_en)
-                            current_state <= SEND_DETECTION_DATA;
-                        else
-                            current_state <= SEND_FOOTER;  // No streams — send footer only
-                    end
-                end
-                
-                SEND_RANGE_DATA: begin
+
+                SEND_DATA_WORD: begin
                     if (!ft601_txe) begin
                         ft601_data_oe <= 1;
-                        ft601_be <= 4'b1111;  // All bytes valid for 32-bit word
-                        
-                        case (byte_counter)
-                            0: ft601_data_out <= range_profile_cap;
-                            1: ft601_data_out <= {range_profile_cap[23:0], 8'h00};
-                            2: ft601_data_out <= {range_profile_cap[15:0], 16'h0000};
-                            3: ft601_data_out <= {range_profile_cap[7:0], 24'h000000};
+                        ft601_wr_n <= 0;
+                        case (data_word_idx)
+                            2'd0: begin
+                                ft601_data_out <= data_pkt_word0;
+                                ft601_be <= 4'b1111;
+                            end
+                            2'd1: begin
+                                ft601_data_out <= data_pkt_word1;
+                                ft601_be <= 4'b1111;
+                            end
+                            2'd2: begin
+                                ft601_data_out <= data_pkt_word2;
+                                ft601_be <= data_pkt_be2;
+                            end
+                            default: ;
                         endcase
-                        
-                        ft601_wr_n <= 0;
-                        
-                        if (byte_counter == 3) begin
-                            byte_counter <= 0;
-                            // Gap 2: skip disabled streams
-                            if (stream_doppler_en)
-                                current_state <= SEND_DOPPLER_DATA;
-                            else if (stream_cfar_en)
-                                current_state <= SEND_DETECTION_DATA;
-                            else
-                                current_state <= SEND_FOOTER;
+                        if (data_word_idx == 2'd2) begin
+                            data_word_idx <= 2'd0;
+                            current_state <= WAIT_ACK;
                         end else begin
-                            byte_counter <= byte_counter + 1;
+                            data_word_idx <= data_word_idx + 2'd1;
                         end
-                    end
-                end
-                
-                SEND_DOPPLER_DATA: begin
-                    if (!ft601_txe && doppler_data_pending) begin
-                        ft601_data_oe <= 1;
-                        ft601_be <= 4'b1111;
-                        
-                        case (byte_counter)
-                            0: ft601_data_out <= {doppler_real_cap, doppler_imag_cap};
-                            1: ft601_data_out <= {doppler_imag_cap, doppler_real_cap[15:8], 8'h00};
-                            2: ft601_data_out <= {doppler_real_cap[7:0], doppler_imag_cap[15:8], 16'h0000};
-                            3: ft601_data_out <= {doppler_imag_cap[7:0], 24'h000000};
-                        endcase
-                        
-                        ft601_wr_n <= 0;
-                        
-                        if (byte_counter == 3) begin
-                            byte_counter <= 0;
-                            doppler_data_pending <= 1'b0;
-                            if (stream_cfar_en)
-                                current_state <= SEND_DETECTION_DATA;
-                            else
-                                current_state <= SEND_FOOTER;
-                        end else begin
-                            byte_counter <= byte_counter + 1;
-                        end
-                    end else if (!doppler_data_pending) begin
-                        // No doppler data available yet — skip to next stream
-                        byte_counter <= 0;
-                        if (stream_cfar_en)
-                            current_state <= SEND_DETECTION_DATA;
-                        else
-                            current_state <= SEND_FOOTER;
-                    end
-                end
-                
-                SEND_DETECTION_DATA: begin
-                    if (!ft601_txe && cfar_data_pending) begin
-                        ft601_data_oe <= 1;
-                        ft601_be <= 4'b0001;
-                        ft601_data_out <= {24'b0, 7'b0, cfar_detection_cap};
-                        ft601_wr_n <= 0;
-                        cfar_data_pending <= 1'b0;
-                        current_state <= SEND_FOOTER;
-                    end else if (!cfar_data_pending) begin
-                        // No CFAR data available yet — skip to footer
-                        current_state <= SEND_FOOTER;
-                    end
-                end
-                
-                SEND_FOOTER: begin
-                    if (!ft601_txe) begin
-                        ft601_data_oe <= 1;
-                        ft601_be <= 4'b0001;
-                        ft601_data_out <= {24'b0, FOOTER};
-                        ft601_wr_n <= 0;
-                        current_state <= WAIT_ACK;
                     end
                 end
 
@@ -581,6 +630,14 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
                 WAIT_ACK: begin
                     ft601_wr_n <= 1;
                     ft601_data_oe <= 0;  // Release data bus
+                    // Clear pending flags — data consumed
+                    doppler_data_pending <= 1'b0;
+                    cfar_data_pending    <= 1'b0;
+                    // Advance frame sync counter
+                    if (sample_counter == NUM_CELLS - 12'd1)
+                        sample_counter <= 12'd0;
+                    else
+                        sample_counter <= sample_counter + 12'd1;
                     current_state <= IDLE;
                 end
             endcase
@@ -613,8 +670,8 @@ ODDR #(
 `else
 // Simulation: behavioral clock forwarding
 reg ft601_clk_out_sim;
-always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
-    if (!ft601_reset_n)
+always @(posedge ft601_clk_in or negedge ft601_effective_reset_n) begin
+    if (!ft601_effective_reset_n)
         ft601_clk_out_sim <= 1'b0;
     else
         ft601_clk_out_sim <= 1'b1;

@@ -138,7 +138,12 @@ usb_data_interface usb_inst (
     .status_range_mode(2'b01),
     .status_self_test_flags(5'b11111),
     .status_self_test_detail(8'hA5),
-    .status_self_test_busy(1'b0)
+    .status_self_test_busy(1'b0),
+    // AGC status: tie off with benign defaults (no AGC on dev board)
+    .status_agc_current_gain(4'd0),
+    .status_agc_peak_magnitude(8'd0),
+    .status_agc_saturation_count(8'd0),
+    .status_agc_enable(1'b0)
 );
 
 endmodule

@@ -16,7 +16,7 @@ import unittest
 import numpy as np
 
 from radar_protocol import (
-    RadarProtocol, FT2232HConnection, DataRecorder, RadarAcquisition,
+    RadarProtocol, FT2232HConnection, FT601Connection, DataRecorder, RadarAcquisition,
     RadarFrame, StatusResponse, Opcode,
     HEADER_BYTE, FOOTER_BYTE, STATUS_HEADER_BYTE,
     NUM_RANGE_BINS, NUM_DOPPLER_BINS,
@@ -309,6 +309,61 @@ class TestFT2232HConnection(unittest.TestCase):
 
     def test_write_when_closed(self):
         conn = FT2232HConnection(mock=True)
+        self.assertFalse(conn.write(b"\x00\x00\x00\x00"))
+
+
+class TestFT601Connection(unittest.TestCase):
+    """Test mock FT601 connection (mirrors FT2232H tests)."""
+
+    def test_mock_open_close(self):
+        conn = FT601Connection(mock=True)
+        self.assertTrue(conn.open())
+        self.assertTrue(conn.is_open)
+        conn.close()
+        self.assertFalse(conn.is_open)
+
+    def test_mock_read_returns_data(self):
+        conn = FT601Connection(mock=True)
+        conn.open()
+        data = conn.read(4096)
+        self.assertIsNotNone(data)
+        self.assertGreater(len(data), 0)
+        conn.close()
+
+    def test_mock_read_contains_valid_packets(self):
+        """Mock data should contain parseable data packets."""
+        conn = FT601Connection(mock=True)
+        conn.open()
+        raw = conn.read(4096)
+        packets = RadarProtocol.find_packet_boundaries(raw)
+        self.assertGreater(len(packets), 0)
+        for start, end, ptype in packets:
+            if ptype == "data":
+                result = RadarProtocol.parse_data_packet(raw[start:end])
+                self.assertIsNotNone(result)
+        conn.close()
+
+    def test_mock_write(self):
+        conn = FT601Connection(mock=True)
+        conn.open()
+        cmd = RadarProtocol.build_command(0x01, 1)
+        self.assertTrue(conn.write(cmd))
+        conn.close()
+
+    def test_write_pads_to_4_bytes(self):
+        """FT601 write() should pad data to 4-byte alignment."""
+        conn = FT601Connection(mock=True)
+        conn.open()
+        # 3-byte payload should be padded internally (no error)
+        self.assertTrue(conn.write(b"\x01\x02\x03"))
+        conn.close()
+
+    def test_read_when_closed(self):
+        conn = FT601Connection(mock=True)
+        self.assertIsNone(conn.read())
+
+    def test_write_when_closed(self):
+        conn = FT601Connection(mock=True)
         self.assertFalse(conn.write(b"\x00\x00\x00\x00"))
 
 

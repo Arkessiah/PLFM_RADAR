@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+# =============================================================================
+# DEPRECATED: GUI V6 Demo is superseded by GUI_V65_Tk and V7.
+# This file is retained for reference only. Do not use for new development.
+# Removal planned for next major release.
+# =============================================================================
+
 """
 Radar System GUI - Fully Functional Demo Version
 All buttons work, simulated radar data is generated in real-time

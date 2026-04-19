@@ -188,13 +188,31 @@ def parse_python_data_packet_fields(filepath: Path | None = None) -> list[DataPa
             width_bits=size * 8
         ))
 
-    # Match detection = raw[9] & 0x01
+    # Match detection = raw[9] & 0x01  (direct access)
     for m in re.finditer(r'(\w+)\s*=\s*raw\[(\d+)\]\s*&\s*(0x[0-9a-fA-F]+|\d+)', body):
         name = m.group(1)
         offset = int(m.group(2))
         fields.append(DataPacketField(
             name=name, byte_start=offset, byte_end=offset, width_bits=1
         ))
+
+    # Match intermediate variable pattern: var = raw[N], then field = var & MASK
+    for m in re.finditer(r'(\w+)\s*=\s*raw\[(\d+)\]', body):
+        var_name = m.group(1)
+        offset = int(m.group(2))
+        # Find fields derived from this intermediate variable
+        for m2 in re.finditer(
+            rf'(\w+)\s*=\s*(?:\({var_name}\s*>>\s*\d+\)\s*&|{var_name}\s*&)\s*'
+            r'(0x[0-9a-fA-F]+|\d+)',
+            body,
+        ):
+            name = m2.group(1)
+            # Skip if already captured by direct raw[] access pattern
+            if not any(f.name == name for f in fields):
+                fields.append(DataPacketField(
+                    name=name, byte_start=offset, byte_end=offset,
+                    width_bits=1
+                ))
 
     fields.sort(key=lambda f: f.byte_start)
     return fields
@@ -584,11 +602,27 @@ def parse_verilog_data_mux(
 
     for m in re.finditer(
         r"5'd(\d+)\s*:\s*data_pkt_byte\s*=\s*(.+?);",
-        mux_body
+        mux_body, re.DOTALL
     ):
         idx = int(m.group(1))
         expr = m.group(2).strip()
         entries.append((idx, expr))
+
+    # Helper: extract the dominant signal name from a mux expression.
+    # Handles direct refs like ``range_profile_cap[31:24]``, ternaries
+    # like ``stream_doppler_en ? doppler_real_cap[15:8] : 8'd0``, and
+    # concat-ternaries like ``stream_cfar_en ? {…, cfar_detection_cap} : …``.
+    def _extract_signal(expr: str) -> str | None:
+        # If it's a ternary, use the true-branch to find the data signal
+        tern = re.match(r'\w+\s*\?\s*(.+?)\s*:\s*.+', expr, re.DOTALL)
+        target = tern.group(1) if tern else expr
+        # Look for a known data signal (xxx_cap pattern or cfar_detection_cap)
+        cap_match = re.search(r'(\w+_cap)\b', target)
+        if cap_match:
+            return cap_match.group(1)
+        # Fall back to first identifier before a bit-select
+        sig_match = re.match(r'(\w+?)(?:\[|$)', target)
+        return sig_match.group(1) if sig_match else None
 
     # Group consecutive bytes by signal root name
     fields: list[DataPacketField] = []
@@ -599,22 +633,21 @@ def parse_verilog_data_mux(
             i += 1
             continue
 
-        # Extract signal name (e.g., range_profile_cap from range_profile_cap[31:24])
-        sig_match = re.match(r'(\w+?)(?:\[|$)', expr)
-        if not sig_match:
+        signal = _extract_signal(expr)
+        if not signal:
             i += 1
             continue
 
-        signal = sig_match.group(1)
         start_byte = idx
         end_byte = idx
 
         # Find consecutive bytes of the same signal
         j = i + 1
         while j < len(entries):
-            next_idx, next_expr = entries[j]
-            if next_expr.startswith(signal):
-                end_byte = next_idx
+            _next_idx, next_expr = entries[j]
+            next_sig = _extract_signal(next_expr)
+            if next_sig == signal:
+                end_byte = _next_idx
                 j += 1
             else:
                 break

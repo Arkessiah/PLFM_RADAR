@@ -36,6 +36,13 @@
  * Clock domains:
  *   clk       = 100 MHz system clock (radar data domain)
  *   ft_clk    = 60 MHz from FT2232H CLKOUT (USB FIFO domain)
+ *
+ * USB disconnect recovery:
+ *   A clock-activity watchdog in the clk domain detects when ft_clk stops
+ *   (USB cable unplugged). After ~0.65 ms of silence (65536 system clocks)
+ *   it asserts ft_clk_lost, which is OR'd into the FT-domain reset so
+ *   FSMs and FIFOs return to a clean state. When ft_clk resumes, a 2-stage
+ *   reset synchronizer deasserts the reset cleanly in the ft_clk domain.
  */
 
 module usb_data_interface_ft2232h (
@@ -59,7 +66,9 @@ module usb_data_interface_ft2232h (
     output reg ft_rd_n,             // Read strobe (active low)
     output reg ft_wr_n,             // Write strobe (active low)
     output reg ft_oe_n,             // Output enable (active low) — bus direction
-    output reg ft_siwu,             // Send Immediate / WakeUp
+    output reg ft_siwu,             // Send Immediate / WakeUp — UNUSED: held low.
+                                    // SIWU could flush the TX FIFO for lower latency
+                                    // but is not needed at current data rates. Deferred.
 
     // Clock from FT2232H (directly used — no ODDR forwarding needed)
     input wire ft_clk,              // 60 MHz from FT2232H CLKOUT
@@ -134,6 +143,7 @@ localparam [2:0] RD_IDLE       = 3'd0,
 reg [2:0] rd_state;
 reg [1:0] rd_byte_cnt;   // 0..3 for 4-byte command word
 reg [31:0] rd_shift_reg;  // Shift register to assemble 4-byte command
+reg rd_cmd_complete;      // Set when all 4 bytes received (distinguishes from abort)
 
 // ============================================================================
 // DATA BUS DIRECTION CONTROL
@@ -192,6 +202,70 @@ always @(posedge clk or negedge reset_n) begin
     end
 end
 
+// ============================================================================
+// CLOCK-ACTIVITY WATCHDOG (clk domain)
+// ============================================================================
+// Detects when ft_clk stops (USB cable unplugged). A toggle register in the
+// ft_clk domain flips every ft_clk edge. The clk domain synchronizes it and
+// checks for transitions. If no transition is seen for 2^16 = 65536 clk
+// cycles (~0.65 ms at 100 MHz), ft_clk_lost asserts.
+//
+// ft_clk_lost feeds into the effective reset for the ft_clk domain so that
+// FSMs and capture registers return to a clean state automatically.
+
+// Toggle register: flips every ft_clk edge (ft_clk domain)
+reg ft_heartbeat;
+always @(posedge ft_clk or negedge ft_reset_n) begin
+    if (!ft_reset_n)
+        ft_heartbeat <= 1'b0;
+    else
+        ft_heartbeat <= ~ft_heartbeat;
+end
+
+// Synchronize heartbeat into clk domain (2-stage)
+(* ASYNC_REG = "TRUE" *) reg [1:0] ft_hb_sync;
+reg ft_hb_prev;
+reg [15:0] ft_clk_timeout;
+reg ft_clk_lost;
+
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        ft_hb_sync    <= 2'b00;
+        ft_hb_prev    <= 1'b0;
+        ft_clk_timeout <= 16'd0;
+        ft_clk_lost   <= 1'b0;
+    end else begin
+        ft_hb_sync <= {ft_hb_sync[0], ft_heartbeat};
+        ft_hb_prev <= ft_hb_sync[1];
+
+        if (ft_hb_sync[1] != ft_hb_prev) begin
+            // ft_clk is alive — reset counter, clear lost flag
+            ft_clk_timeout <= 16'd0;
+            ft_clk_lost    <= 1'b0;
+        end else if (!ft_clk_lost) begin
+            if (ft_clk_timeout == 16'hFFFF)
+                ft_clk_lost <= 1'b1;
+            else
+                ft_clk_timeout <= ft_clk_timeout + 16'd1;
+        end
+    end
+end
+
+// Effective FT-domain reset: asserted by global reset OR clock loss.
+// Deassertion synchronized to ft_clk via 2-stage sync to avoid
+// metastability on the recovery edge.
+(* ASYNC_REG = "TRUE" *) reg [1:0] ft_reset_sync;
+wire ft_reset_raw_n = ft_reset_n & ~ft_clk_lost;
+
+always @(posedge ft_clk or negedge ft_reset_raw_n) begin
+    if (!ft_reset_raw_n)
+        ft_reset_sync <= 2'b00;
+    else
+        ft_reset_sync <= {ft_reset_sync[0], 1'b1};
+end
+
+wire ft_effective_reset_n = ft_reset_sync[1];
+
 // --- 3-stage synchronizers (ft_clk domain) ---
 // 3 stages for better MTBF at 60 MHz
 
@@ -228,12 +302,25 @@ reg cfar_detection_cap;
 reg doppler_data_pending;
 reg cfar_data_pending;
 
+// 1-cycle delayed range trigger.  range_valid_ft fires on the same clock
+// edge that range_profile_cap is captured (non-blocking).  If the FSM
+// reads range_profile_cap on that same edge it sees the STALE value.
+// Delaying the trigger by one cycle guarantees the capture register has
+// settled before the byte mux reads it.
+reg range_data_ready;
+
+// Frame sync: sample counter (ft_clk domain, wraps at NUM_CELLS)
+// Bit 7 of detection byte is set when sample_counter == 0 (frame start).
+// This allows the Python host to resynchronize without a protocol change.
+localparam [11:0] NUM_CELLS = 12'd2048;  // 64 range x 32 doppler
+reg [11:0] sample_counter;
+
 // Status snapshot (ft_clk domain)
 reg [31:0] status_words [0:5];
 
 integer si;  // status_words loop index
-always @(posedge ft_clk or negedge ft_reset_n) begin
-    if (!ft_reset_n) begin
+always @(posedge ft_clk or negedge ft_effective_reset_n) begin
+    if (!ft_effective_reset_n) begin
         range_toggle_sync   <= 3'b000;
         doppler_toggle_sync <= 3'b000;
         cfar_toggle_sync    <= 3'b000;
@@ -246,6 +333,7 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
         doppler_real_cap    <= 16'd0;
         doppler_imag_cap    <= 16'd0;
         cfar_detection_cap  <= 1'b0;
+        range_data_ready    <= 1'b0;
         // Default to range-only on reset (prevents write FSM deadlock)
         stream_ctrl_sync_0  <= 3'b001;
         stream_ctrl_sync_1  <= 3'b001;
@@ -278,6 +366,10 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
         end
         if (cfar_valid_ft)
             cfar_detection_cap <= cfar_detection_hold;
+
+        // 1-cycle delayed trigger: ensures range_profile_cap has settled
+        // before the FSM reads it via the byte mux.
+        range_data_ready <= range_valid_ft;
 
         // Status snapshot on request
         if (status_req_ft) begin
@@ -315,11 +407,16 @@ always @(*) begin
         5'd2:  data_pkt_byte = range_profile_cap[23:16];
         5'd3:  data_pkt_byte = range_profile_cap[15:8];
         5'd4:  data_pkt_byte = range_profile_cap[7:0];     // range LSB
-        5'd5:  data_pkt_byte = doppler_real_cap[15:8];      // doppler_real MSB
-        5'd6:  data_pkt_byte = doppler_real_cap[7:0];       // doppler_real LSB
-        5'd7:  data_pkt_byte = doppler_imag_cap[15:8];      // doppler_imag MSB
-        5'd8:  data_pkt_byte = doppler_imag_cap[7:0];       // doppler_imag LSB
-        5'd9:  data_pkt_byte = {7'b0, cfar_detection_cap};  // detection
+        // Doppler fields: zero when stream_doppler_en is off
+        5'd5:  data_pkt_byte = stream_doppler_en ? doppler_real_cap[15:8]  : 8'd0;
+        5'd6:  data_pkt_byte = stream_doppler_en ? doppler_real_cap[7:0]   : 8'd0;
+        5'd7:  data_pkt_byte = stream_doppler_en ? doppler_imag_cap[15:8]  : 8'd0;
+        5'd8:  data_pkt_byte = stream_doppler_en ? doppler_imag_cap[7:0]   : 8'd0;
+        // Detection field: zero when stream_cfar_en is off
+        // Bit 7 = frame_start flag (sample_counter == 0), bit 0 = cfar_detection
+        5'd9:  data_pkt_byte = stream_cfar_en
+                   ? {(sample_counter == 12'd0), 6'b0, cfar_detection_cap}
+                   : {(sample_counter == 12'd0), 7'd0};
         5'd10: data_pkt_byte = FOOTER;
         default: data_pkt_byte = 8'h00;
     endcase
@@ -376,12 +473,13 @@ end
 // Write FSM and Read FSM share the bus. Write FSM operates when Read FSM
 // is idle. Read FSM takes priority when host has data available.
 
-always @(posedge ft_clk or negedge ft_reset_n) begin
-    if (!ft_reset_n) begin
+always @(posedge ft_clk or negedge ft_effective_reset_n) begin
+    if (!ft_effective_reset_n) begin
         wr_state       <= WR_IDLE;
         wr_byte_idx    <= 5'd0;
         rd_state       <= RD_IDLE;
         rd_byte_cnt    <= 2'd0;
+        rd_cmd_complete <= 1'b0;
         rd_shift_reg   <= 32'd0;
         ft_data_out    <= 8'd0;
         ft_data_oe     <= 1'b0;
@@ -396,6 +494,7 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
         cmd_value      <= 16'd0;
         doppler_data_pending <= 1'b0;
         cfar_data_pending    <= 1'b0;
+        sample_counter       <= 12'd0;
     end else begin
         // Default: clear one-shot signals
         cmd_valid <= 1'b0;
@@ -437,17 +536,19 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
                 rd_shift_reg <= {rd_shift_reg[23:0], ft_data};
                 if (rd_byte_cnt == 2'd3) begin
                     // All 4 bytes received
-                    ft_rd_n     <= 1'b1;
-                    rd_byte_cnt <= 2'd0;
-                    rd_state    <= RD_DEASSERT;
+                    ft_rd_n         <= 1'b1;
+                    rd_byte_cnt     <= 2'd0;
+                    rd_cmd_complete <= 1'b1;
+                    rd_state        <= RD_DEASSERT;
                 end else begin
                     rd_byte_cnt <= rd_byte_cnt + 2'd1;
                     // Keep reading if more data available
                     if (ft_rxf_n) begin
                         // Host ran out of data mid-command — abort
-                        ft_rd_n     <= 1'b1;
-                        rd_byte_cnt <= 2'd0;
-                        rd_state    <= RD_DEASSERT;
+                        ft_rd_n         <= 1'b1;
+                        rd_byte_cnt     <= 2'd0;
+                        rd_cmd_complete <= 1'b0;
+                        rd_state        <= RD_DEASSERT;
                     end
                 end
             end
@@ -456,7 +557,8 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
                 // Deassert OE (1 cycle after RD deasserted)
                 ft_oe_n  <= 1'b1;
                 // Only process if we received a full 4-byte command
-                if (rd_byte_cnt == 2'd0) begin
+                if (rd_cmd_complete) begin
+                    rd_cmd_complete <= 1'b0;
                     rd_state <= RD_PROCESS;
                 end else begin
                     // Incomplete command — discard
@@ -491,8 +593,13 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
                         wr_state    <= WR_STATUS_SEND;
                         wr_byte_idx <= 5'd0;
                     end
-                    // Trigger on range_valid edge (primary data trigger)
-                    else if (range_valid_ft && stream_range_en) begin
+                    // Trigger on range_data_ready (1 cycle after range_valid_ft)
+                    // so that range_profile_cap has settled from the CDC block.
+                    // Gate on pending flags: only send when all enabled
+                    // streams have fresh data (avoids stale doppler/CFAR)
+                    else if (range_data_ready && stream_range_en
+                             && (!stream_doppler_en || doppler_data_pending)
+                             && (!stream_cfar_en    || cfar_data_pending)) begin
                         if (ft_rxf_n) begin  // No host read pending
                             wr_state    <= WR_DATA_SEND;
                             wr_byte_idx <= 5'd0;
@@ -538,6 +645,11 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
                     // Clear pending flags — data consumed
                     doppler_data_pending <= 1'b0;
                     cfar_data_pending    <= 1'b0;
+                    // Advance frame sync counter
+                    if (sample_counter == NUM_CELLS - 12'd1)
+                        sample_counter <= 12'd0;
+                    else
+                        sample_counter <= sample_counter + 12'd1;
                     wr_state   <= WR_IDLE;
                 end
 

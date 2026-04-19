@@ -70,9 +70,10 @@ set_input_jitter [get_clocks clk_100m] 0.1
 # NOTE: The physical DAC (U3, AD9708) receives its clock directly from the
 #       AD9523 via a separate net (DAC_CLOCK), NOT from the FPGA. The FPGA
 #       uses this clock input for internal DAC data timing only. The RTL port
-#       `dac_clk` is an output that assigns clk_120m directly — it has no
-#       separate physical pin on this board and should be removed from the
-#       RTL or left unconnected.
+#       `dac_clk` is an RTL output that assigns clk_120m directly. It has no
+#       physical pin on the 50T board and is left unconnected here. The port
+#       CANNOT be removed from the RTL because the 200T board uses it with
+#       ODDR clock forwarding (pin H17, see xc7a200t_fbg484.xdc).
 # FIX: Moved from C13 (IO_L12N = N-type) to D13 (IO_L12P = P-type MRCC).
 #      Clock inputs must use the P-type pin of an MRCC pair (PLIO-9 DRC).
 set_property PACKAGE_PIN D13 [get_ports {clk_120m_dac}]
@@ -332,6 +333,44 @@ set_property DRIVE 8 [get_ports {ft_data[*]}]
 
 # ft_clkout constrained above in CLOCK CONSTRAINTS section (C4, 60 MHz)
 
+# --------------------------------------------------------------------------
+# FT2232H Source-Synchronous Timing Constraints
+# --------------------------------------------------------------------------
+# FT2232H 245 Synchronous FIFO mode timing (60 MHz, period = 16.667 ns):
+#
+# FPGA Read Path (FT2232H drives data, FPGA samples):
+#   - Data valid before CLKOUT rising edge: t_vr(max) = 7.0 ns
+#   - Data hold after CLKOUT rising edge:   t_hr(min) = 0.0 ns
+#   - Input delay max = period - t_vr = 16.667 - 7.0 = 9.667 ns
+#   - Input delay min = t_hr = 0.0 ns
+#
+# FPGA Write Path (FPGA drives data, FT2232H samples):
+#   - Data setup before next CLKOUT rising: t_su = 5.0 ns
+#   - Data hold after CLKOUT rising:        t_hd = 0.0 ns
+#   - Output delay max = period - t_su = 16.667 - 5.0 = 11.667 ns
+#   - Output delay min = t_hd = 0.0 ns
+# --------------------------------------------------------------------------
+
+# Input delays: FT2232H → FPGA (data bus and status signals)
+set_input_delay -clock [get_clocks ft_clkout] -max 9.667 [get_ports {ft_data[*]}]
+set_input_delay -clock [get_clocks ft_clkout] -min 0.0   [get_ports {ft_data[*]}]
+set_input_delay -clock [get_clocks ft_clkout] -max 9.667 [get_ports {ft_rxf_n}]
+set_input_delay -clock [get_clocks ft_clkout] -min 0.0   [get_ports {ft_rxf_n}]
+set_input_delay -clock [get_clocks ft_clkout] -max 9.667 [get_ports {ft_txe_n}]
+set_input_delay -clock [get_clocks ft_clkout] -min 0.0   [get_ports {ft_txe_n}]
+
+# Output delays: FPGA → FT2232H (control strobes and data bus when writing)
+set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_data[*]}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_data[*]}]
+set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_rd_n}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_rd_n}]
+set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_wr_n}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_wr_n}]
+set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_oe_n}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_oe_n}]
+set_output_delay -clock [get_clocks ft_clkout] -max 11.667 [get_ports {ft_siwu}]
+set_output_delay -clock [get_clocks ft_clkout] -min 0.0    [get_ports {ft_siwu}]
+
 # ============================================================================
 # STATUS / DEBUG OUTPUTS — NO PHYSICAL CONNECTIONS
 # ============================================================================
@@ -418,10 +457,10 @@ set_property BITSTREAM.CONFIG.UNUSEDPIN Pullup [current_design]
 # 4. JTAG: FPGA_TCK (L7), FPGA_TDI (N7), FPGA_TDO (N8), FPGA_TMS (M7).
 #    Dedicated pins — no XDC constraints needed.
 #
-# 5. dac_clk port: The RTL top module declares `dac_clk` as an output, but
-#    the physical board wires the DAC clock (AD9708 CLOCK pin) directly from
-#    the AD9523, not from the FPGA. This port should be removed from the RTL
-#    or left unconnected. It currently just assigns clk_120m_dac passthrough.
+# 5. dac_clk port: Not connected on the 50T board (DAC clocked directly from
+#    AD9523). The RTL port exists for 200T board compatibility, where the FPGA
+#    forwards the DAC clock via ODDR to pin H17 with generated clock and
+#    timing constraints (see xc7a200t_fbg484.xdc). Do NOT remove from RTL.
 #
 # ============================================================================
 # END OF CONSTRAINTS

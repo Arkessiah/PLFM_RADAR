@@ -108,12 +108,12 @@ class RadarSettings:
     range_resolution and velocity_resolution should be calibrated to
     the actual waveform parameters.
     """
-    system_frequency: float = 10e9      # Hz (carrier, used for velocity calc)
-    range_resolution: float = 781.25    # Meters per range bin (default: 50km/64)
-    velocity_resolution: float = 1.0    # m/s per Doppler bin (calibrate to waveform)
-    max_distance: float = 50000         # Max detection range (m)
-    map_size: float = 50000             # Map display size (m)
-    coverage_radius: float = 50000      # Map coverage radius (m)
+    system_frequency: float = 10.5e9    # Hz (carrier, used for velocity calc)
+    range_resolution: float = 24.0       # Meters per range bin (c/(2*Fs)*decim)
+    velocity_resolution: float = 1.0     # m/s per Doppler bin (calibrate to waveform)
+    max_distance: float = 1536           # Max detection range (m)
+    map_size: float = 2000               # Map display size (m)
+    coverage_radius: float = 1536        # Map coverage radius (m)
 
 
 @dataclass
@@ -199,39 +199,46 @@ class WaveformConfig:
     Encapsulates the radar waveform so that range/velocity resolution
     can be derived automatically instead of hardcoded in RadarSettings.
 
-    Defaults match the ADI CN0566 Phaser capture parameters used in
-    the golden_reference cosim (4 MSPS, 500 MHz BW, 300 us chirp).
+    Defaults match the AERIS-10 production system parameters from
+    radar_scene.py / plfm_chirp_controller.v:
+      100 MSPS DDC output, 20 MHz chirp BW, 30 us long chirp,
+      167 us long-chirp PRI, X-band 10.5 GHz carrier.
     """
 
-    sample_rate_hz: float = 4e6          # ADC sample rate
-    bandwidth_hz: float = 500e6          # Chirp bandwidth
-    chirp_duration_s: float = 300e-6     # Chirp ramp time
-    center_freq_hz: float = 10.525e9     # Carrier frequency
+    sample_rate_hz: float = 100e6        # DDC output I/Q rate (matched filter input)
+    bandwidth_hz: float = 20e6           # Chirp bandwidth (not used in range calc;
+                                         # retained for time-bandwidth product / display)
+    chirp_duration_s: float = 30e-6      # Long chirp ramp time
+    pri_s: float = 167e-6               # Pulse repetition interval (chirp + listen)
+    center_freq_hz: float = 10.5e9       # Carrier frequency (radar_scene.py: F_CARRIER)
     n_range_bins: int = 64               # After decimation
-    n_doppler_bins: int = 32             # After Doppler FFT
+    n_doppler_bins: int = 32             # Total Doppler bins (2 sub-frames x 16)
+    chirps_per_subframe: int = 16        # Chirps in one Doppler sub-frame
     fft_size: int = 1024                 # Pre-decimation FFT length
     decimation_factor: int = 16          # 1024 → 64
 
     @property
     def range_resolution_m(self) -> float:
-        """Meters per decimated range bin (FMCW deramped baseband).
+        """Meters per decimated range bin (matched-filter pulse compression).
 
-        For deramped FMCW: bin spacing = c * Fs * T / (2 * N_FFT * BW).
-        After decimation the bin spacing grows by *decimation_factor*.
+        For FFT-based matched filtering, each IFFT output bin spans
+        c / (2 * Fs) in range, where Fs is the I/Q sample rate at the
+        matched-filter input (DDC output).  After decimation the bin
+        spacing grows by *decimation_factor*.
         """
         c = 299_792_458.0
-        raw_bin = (
-            c * self.sample_rate_hz * self.chirp_duration_s
-            / (2.0 * self.fft_size * self.bandwidth_hz)
-        )
+        raw_bin = c / (2.0 * self.sample_rate_hz)
         return raw_bin * self.decimation_factor
 
     @property
     def velocity_resolution_mps(self) -> float:
-        """m/s per Doppler bin.  lambda / (2 * n_doppler * chirp_duration)."""
+        """m/s per Doppler bin.
+
+        lambda / (2 * chirps_per_subframe * PRI), matching radar_scene.py.
+        """
         c = 299_792_458.0
         wavelength = c / self.center_freq_hz
-        return wavelength / (2.0 * self.n_doppler_bins * self.chirp_duration_s)
+        return wavelength / (2.0 * self.chirps_per_subframe * self.pri_s)
 
     @property
     def max_range_m(self) -> float:

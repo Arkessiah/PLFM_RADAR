@@ -59,7 +59,7 @@ except (ModuleNotFoundError, ImportError):
 
 # Import protocol layer (no GUI deps)
 from radar_protocol import (
-    RadarProtocol, FT2232HConnection,
+    RadarProtocol, FT2232HConnection, FT601Connection,
     DataRecorder, RadarAcquisition,
     RadarFrame, StatusResponse,
     NUM_RANGE_BINS, NUM_DOPPLER_BINS, WATERFALL_DEPTH,
@@ -98,9 +98,10 @@ class DemoTarget:
 
     __slots__ = ("azimuth", "classification", "id", "range_m", "snr", "velocity")
 
-    # Physical range grid: 64 bins x ~4.8 m/bin = ~307 m max
-    _RANGE_PER_BIN: float = (3e8 / (2 * 500e6)) * 16  # ~4.8 m
-    _MAX_RANGE: float = _RANGE_PER_BIN * NUM_RANGE_BINS  # ~307 m
+    # Physical range grid: 64 bins x ~24 m/bin = ~1536 m max
+    # Bin spacing = c / (2 * Fs) * decimation, where Fs = 100 MHz DDC output.
+    _RANGE_PER_BIN: float = (3e8 / (2 * 100e6)) * 16  # ~24 m
+    _MAX_RANGE: float = _RANGE_PER_BIN * NUM_RANGE_BINS  # ~1536 m
 
     def __init__(self, tid: int):
         self.id = tid
@@ -187,10 +188,10 @@ class DemoSimulator:
         mag = np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS), dtype=np.float64)
         det = np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS), dtype=np.uint8)
 
-        # Range/Doppler scaling (approximate)
-        range_per_bin = (3e8 / (2 * 500e6)) * 16  # ~4.8 m/bin
+        # Range/Doppler scaling: bin spacing = c/(2*Fs)*decimation
+        range_per_bin = (3e8 / (2 * 100e6)) * 16  # ~24 m/bin
         max_range = range_per_bin * NUM_RANGE_BINS
-        vel_per_bin = 1.484  # m/s per Doppler bin (from WaveformConfig)
+        vel_per_bin = 5.34  # m/s per Doppler bin (radar_scene.py: lam/(2*16*PRI))
 
         for t in targets:
             if t.range_m > max_range or t.range_m < 0:
@@ -385,13 +386,14 @@ class RadarDashboard:
     UPDATE_INTERVAL_MS = 100  # 10 Hz display refresh
 
     # Radar parameters used for range-axis scaling.
-    BANDWIDTH = 500e6        # Hz — chirp bandwidth
+    SAMPLE_RATE = 100e6      # Hz — DDC output I/Q rate (matched filter input)
     C = 3e8                  # m/s — speed of light
 
-    def __init__(self, root: tk.Tk, connection: FT2232HConnection,
+    def __init__(self, root: tk.Tk, mock: bool,
                  recorder: DataRecorder, device_index: int = 0):
         self.root = root
-        self.conn = connection
+        self._mock = mock
+        self.conn: FT2232HConnection | FT601Connection | None = None
         self.recorder = recorder
         self.device_index = device_index
 
@@ -485,6 +487,16 @@ class RadarDashboard:
                                        style="Accent.TButton")
         self.btn_connect.pack(side="right", padx=4)
 
+        # USB Interface selector (production FT2232H / premium FT601)
+        self._usb_iface_var = tk.StringVar(value="FT2232H (Production)")
+        self.cmb_usb_iface = ttk.Combobox(
+            top, textvariable=self._usb_iface_var,
+            values=["FT2232H (Production)", "FT601 (Premium)"],
+            state="readonly", width=20,
+        )
+        self.cmb_usb_iface.pack(side="right", padx=4)
+        ttk.Label(top, text="USB:", font=("Menlo", 10)).pack(side="right")
+
         self.btn_record = ttk.Button(top, text="Record", command=self._on_record)
         self.btn_record.pack(side="right", padx=4)
 
@@ -515,9 +527,8 @@ class RadarDashboard:
 
     def _build_display_tab(self, parent):
         # Compute physical axis limits
-        range_res = self.C / (2.0 * self.BANDWIDTH)  # ~0.3 m per FFT bin
-        # After decimation 1024→64, each range bin = 16 FFT bins
-        range_per_bin = range_res * 16
+        # Bin spacing = c / (2 * Fs_ddc) for matched-filter processing.
+        range_per_bin = self.C / (2.0 * self.SAMPLE_RATE) * 16  # ~24 m
         max_range = range_per_bin * NUM_RANGE_BINS
 
         doppler_bin_lo = 0
@@ -1018,15 +1029,17 @@ class RadarDashboard:
 
     # ------------------------------------------------------------ Actions
     def _on_connect(self):
-        if self.conn.is_open:
+        if self.conn is not None and self.conn.is_open:
             # Disconnect
             if self._acq_thread is not None:
                 self._acq_thread.stop()
                 self._acq_thread.join(timeout=2)
                 self._acq_thread = None
             self.conn.close()
+            self.conn = None
             self.lbl_status.config(text="DISCONNECTED", foreground=RED)
             self.btn_connect.config(text="Connect")
+            self.cmb_usb_iface.config(state="readonly")
             log.info("Disconnected")
             return
 
@@ -1035,6 +1048,16 @@ class RadarDashboard:
             self._stop_demo()
         if self._replay_active:
             self._replay_stop()
+
+        # Create connection based on USB Interface selector
+        iface = self._usb_iface_var.get()
+        if "FT601" in iface:
+            self.conn = FT601Connection(mock=self._mock)
+        else:
+            self.conn = FT2232HConnection(mock=self._mock)
+
+        # Disable interface selector while connecting/connected
+        self.cmb_usb_iface.config(state="disabled")
 
         # Open connection in a background thread to avoid blocking the GUI
         self.lbl_status.config(text="CONNECTING...", foreground=YELLOW)
@@ -1062,6 +1085,8 @@ class RadarDashboard:
         else:
             self.lbl_status.config(text="CONNECT FAILED", foreground=RED)
             self.btn_connect.config(text="Connect")
+            self.cmb_usb_iface.config(state="readonly")
+            self.conn = None
 
     def _on_record(self):
         if self.recorder.recording:
@@ -1110,6 +1135,9 @@ class RadarDashboard:
                  f"Opcode 0x{opcode:02X} is hardware-only (ignored in replay)"))
             return
         cmd = RadarProtocol.build_command(opcode, value)
+        if self.conn is None:
+            log.warning("No connection — command not sent")
+            return
         ok = self.conn.write(cmd)
         log.info(f"CMD 0x{opcode:02X} val={value} ({'OK' if ok else 'FAIL'})")
 
@@ -1148,7 +1176,7 @@ class RadarDashboard:
         if self._replay_active or self._replay_ctrl is not None:
             self._replay_stop()
         if self._acq_thread is not None:
-            if self.conn.is_open:
+            if self.conn is not None and self.conn.is_open:
                 self._on_connect()  # disconnect
             else:
                 # Connection dropped unexpectedly — just clean up the thread
@@ -1547,17 +1575,17 @@ def main():
     args = parser.parse_args()
 
     if args.live:
-        conn = FT2232HConnection(mock=False)
+        mock = False
         mode_str = "LIVE"
     else:
-        conn = FT2232HConnection(mock=True)
+        mock = True
         mode_str = "MOCK"
 
     recorder = DataRecorder()
 
     root = tk.Tk()
 
-    dashboard = RadarDashboard(root, conn, recorder, device_index=args.device)
+    dashboard = RadarDashboard(root, mock, recorder, device_index=args.device)
 
     if args.record:
         filepath = os.path.join(
@@ -1582,8 +1610,8 @@ def main():
         if dashboard._acq_thread is not None:
             dashboard._acq_thread.stop()
             dashboard._acq_thread.join(timeout=2)
-        if conn.is_open:
-            conn.close()
+        if dashboard.conn is not None and dashboard.conn.is_open:
+            dashboard.conn.close()
         if recorder.recording:
             recorder.stop()
         root.destroy()
