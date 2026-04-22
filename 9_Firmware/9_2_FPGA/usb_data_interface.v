@@ -291,8 +291,8 @@ reg range_data_ready;
 
 // Frame sync: sample counter (ft601_clk domain, wraps at NUM_CELLS)
 // Bit 7 of detection byte is set when sample_counter == 0 (frame start).
-localparam [11:0] NUM_CELLS = 12'd2048;  // 64 range x 32 doppler
-reg [11:0] sample_counter;
+localparam [14:0] NUM_CELLS = 15'd16384;  // 512 range x 32 doppler
+reg [14:0] sample_counter;
 
 // Gap 2: CDC for stream_control (clk_100m -> ft601_clk_in)
 // stream_control changes infrequently (only on host USB command), so
@@ -442,7 +442,7 @@ always @(posedge ft601_clk_in or negedge ft601_effective_reset_n) begin
         data_pkt_word1 <= 32'd0;
         data_pkt_word2 <= 32'd0;
         data_pkt_be2   <= 4'b1110;
-        sample_counter <= 12'd0;
+        sample_counter <= 15'd0;
         // NOTE: ft601_clk_out is driven by the clk-domain always block below.
         // Do NOT assign it here (ft601_clk_in domain) — causes multi-driven net.
     end else begin
@@ -553,8 +553,8 @@ always @(posedge ft601_clk_in or negedge ft601_effective_reset_n) begin
                                                stream_doppler_en ? doppler_imag_cap[15:8] : 8'd0};
                             data_pkt_word2 <= {stream_doppler_en ? doppler_imag_cap[7:0]  : 8'd0,
                                                stream_cfar_en
-                                                    ? {(sample_counter == 12'd0), 6'b0, cfar_detection_cap}
-                                                    : {(sample_counter == 12'd0), 7'd0},
+                                                    ? {(sample_counter == 15'd0), 6'b0, cfar_detection_cap}
+                                                    : {(sample_counter == 15'd0), 7'd0},
                                                FOOTER,
                                                8'h00};  // pad byte
                             data_pkt_be2   <= 4'b1110;   // 3 valid bytes + 1 pad
@@ -634,10 +634,10 @@ always @(posedge ft601_clk_in or negedge ft601_effective_reset_n) begin
                     doppler_data_pending <= 1'b0;
                     cfar_data_pending    <= 1'b0;
                     // Advance frame sync counter
-                    if (sample_counter == NUM_CELLS - 12'd1)
-                        sample_counter <= 12'd0;
+                    if (sample_counter == NUM_CELLS - 15'd1)
+                        sample_counter <= 15'd0;
                     else
-                        sample_counter <= sample_counter + 12'd1;
+                        sample_counter <= sample_counter + 15'd1;
                     current_state <= IDLE;
                 end
             endcase
